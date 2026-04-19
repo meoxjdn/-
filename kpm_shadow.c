@@ -9,26 +9,37 @@
 #include <linux/highmem.h>
 #include <asm/pgtable.h>
 #include <asm/tlbflush.h>
+#include <linux/pgtable.h> /* 修复 5.15 缺失的通用页表宏 */
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Reverse Engineering Expert");
 MODULE_DESCRIPTION("Android WuWa - PTE Swap Shadow Page Engine");
 
-/* 用户层下发的魔法指令 */
 #define PR_WXSHADOW_PATCH   0x57580006
 #define PR_WXSHADOW_RELEASE 0x57580008
 
-/* * 极客流：使用内联汇编强制刷新 TLB 和 I-Cache 
- * 避免高版本 GKI 不导出 flush_tlb_page 等符号导致编译失败
+/* * 【终极兼容补丁】
+ * 如果即使包含了 <linux/pgtable.h>，高冷编译链依然找不到 pte_pgprot，
+ * 我们就用按位异或 (XOR) 算法，物理剥离出 Protection Bits！
+ */
+#ifndef pte_pgprot
+static inline pgprot_t my_pte_pgprot(pte_t pte) {
+    /* 原始 PTE 异或 (只有原PFN+0权限的空壳PTE) = 纯净权限位 */
+    return __pgprot(pte_val(pte) ^ pte_val(pfn_pte(pte_pfn(pte), __pgprot(0))));
+}
+#define pte_pgprot my_pte_pgprot
+#endif
+
+/* * 强制刷新 TLB 和 I-Cache 
  */
 static void force_flush_tlb_icache(void)
 {
     asm volatile(
-        "dsb ishst\n"        // 确保页表写入完成
-        "tlbi vmalle1is\n"   // 使得 Inner Shareable 域内的所有 TLB 失效
-        "dsb ish\n"          // 确保 TLB 失效完成
-        "isb\n"              // 清空指令流水线
-        "ic ialluis\n"       // 使得 Inner Shareable 域内的所有 I-Cache 失效
+        "dsb ishst\n"        
+        "tlbi vmalle1is\n"   
+        "dsb ish\n"          
+        "isb\n"              
+        "ic ialluis\n"       
         "dsb ish\n"
         "isb\n"
         : : : "memory");
@@ -56,13 +67,13 @@ static int apply_shadow_pte(pid_t pid, unsigned long vaddr, void __user *patch_b
     mm = get_task_mm(task);
     if (!mm) { put_task_struct(task); return -EINVAL; }
 
-    /* 1. 申请一块干净的高端匿名物理页 */
+    /* 1. 申请干净的物理页 */
     new_page = alloc_page(GFP_HIGHUSER | __GFP_ZERO);
     if (!new_page) { ret = -ENOMEM; goto out_mm; }
 
     mmap_read_lock(mm);
 
-    /* 2. 页表漫游 (Page Table Walk)，寻找目标地址的底层 PTE */
+    /* 2. 页表漫游 */
     pgd = pgd_offset(mm, vaddr);
     if (pgd_none(*pgd) || pgd_bad(*pgd)) goto out_unlock;
     
@@ -90,10 +101,8 @@ static int apply_shadow_pte(pid_t pid, unsigned long vaddr, void __user *patch_b
     kaddr_old = kmap(old_page);
     kaddr_new = kmap(new_page);
     
-    // 完整拷贝原物理页的 4KB 数据
     memcpy(kaddr_new, kaddr_old, PAGE_SIZE);
     
-    // 在精确的页内偏移处，强行写入用户层传来的 Patch 数据 (比如 B 指令的机器码)
     if (copy_from_user((char *)kaddr_new + (vaddr & ~PAGE_MASK), patch_buf, patch_len)) {
         kunmap(new_page);
         kunmap(old_page);
@@ -104,13 +113,13 @@ static int apply_shadow_pte(pid_t pid, unsigned long vaddr, void __user *patch_b
     kunmap(new_page);
     kunmap(old_page);
 
-    /* 4. 移花接木：将进程的 PTE 指向我们魔改过的新物理页，保留原有权限 */
+    /* 4. 移花接木，安全提取原保护位 */
     pte = mk_pte(new_page, pte_pgprot(pte));
     set_pte_at(mm, vaddr, ptep, pte);
     
     pte_unmap_unlock(ptep, ptl);
 
-    /* 5. 暴力刷新缓存，让 CPU 乖乖去读新页 */
+    /* 5. 暴力刷新缓存 */
     force_flush_tlb_icache();
 
     ret = 0;
@@ -130,7 +139,6 @@ out_mm:
  */
 static int prctl_pre_handler(struct kprobe *p, struct pt_regs *regs)
 {
-    /* ARM64 的系统调用参数依次存放在 x0 - x7 寄存器中 */
     int option = (int)regs->regs[0];
 
     if (option == PR_WXSHADOW_PATCH) {
@@ -140,17 +148,12 @@ static int prctl_pre_handler(struct kprobe *p, struct pt_regs *regs)
         size_t len = (size_t)regs->regs[4];
 
         apply_shadow_pte(pid, vaddr, buf, len);
-        
-        /* * 我们不强行修改 PC，放行原系统调用。
-         * 内核原版的 prctl 不认识 0x57580006，会返回 -EINVAL (22)。
-         * 刚好适配用户层 check_kpm() 的 (errno == 22) 存活检测逻辑。
-         */
     }
     else if (option == PR_WXSHADOW_RELEASE) {
         pr_info("[kpm_shadow] WXSHADOW_RELEASE Heartbeat OK.\n");
     }
 
-    return 0; // 0 表示放行，继续执行原函数
+    return 0; 
 }
 
 static struct kprobe kp = {
@@ -162,7 +165,6 @@ static int __init kpm_shadow_init(void)
 {
     int ret = register_kprobe(&kp);
     if (ret < 0) {
-        /* 兼容老版本内核的系统调用命名规范 */
         kp.symbol_name = "sys_prctl";
         ret = register_kprobe(&kp);
         if (ret < 0) {
