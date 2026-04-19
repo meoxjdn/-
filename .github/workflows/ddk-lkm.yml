@@ -1,0 +1,59 @@
+name: DDK Build Kernel Module
+
+on:
+  workflow_call:
+    inputs:
+      kmi:
+        description: 'KMI version (e.g., android14-6.1)'
+        required: true
+        type: string
+      ddk_release:
+        description: 'DDK container release tag'
+        required: false
+        default: '20251016'
+        type: string
+      module_name:
+        description: 'Kernel module name (without .ko)'
+        required: false
+        default: 'android-wuwa'
+        type: string
+
+jobs:
+  build-module:
+    name: Build ${{ inputs.module_name }}.ko for ${{ inputs.kmi }}
+    runs-on: ubuntu-latest
+    container:
+      # 拉取指定版本的 Android GKI 编译环境
+      image: ghcr.io/ylarod/ddk:${{ inputs.kmi }}-${{ inputs.ddk_release }}
+      options: --privileged
+
+    steps:
+    - name: Checkout source code
+      uses: actions/checkout@v4
+
+    - name: Compile Kernel Module
+      run: |
+        echo "=== Building ${{ inputs.module_name }}.ko for KMI: ${{ inputs.kmi }} ==="
+        make KDIR=$KERNEL_SRC
+        
+        mkdir -p /github/workspace/out
+        
+        # 核心改写点：利用 cut 命令切割字符串，只保留内核版本号
+        # 例如从 "android16-6.12" 提取出 "6.12"
+        SHORT_KMI=$(echo "${{ inputs.kmi }}" | cut -d'-' -f2)
+        OUTPUT_NAME="${SHORT_KMI}.ko"
+        
+        cp "${{ inputs.module_name }}.ko" "/github/workspace/out/$OUTPUT_NAME"
+
+        echo "=== Stripping debug symbols to reduce size ==="
+        llvm-strip -d "/github/workspace/out/$OUTPUT_NAME"
+        
+        # 将最终文件名写入环境变量，传递给下一步
+        echo "ARTIFACT_NAME=$OUTPUT_NAME" >> $GITHUB_ENV
+
+    - name: Upload Build Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        # 上传的压缩包和内部文件都将是干净的 6.12.ko 形式
+        name: ${{ env.ARTIFACT_NAME }}
+        path: /github/workspace/out/${{ env.ARTIFACT_NAME }}
