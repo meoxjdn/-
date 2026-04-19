@@ -1,8 +1,6 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
-#include <linux/miscdevice.h>
-#include <linux/fs.h>
 #include <linux/sched.h>
 #include <linux/sched/mm.h>
 #include <linux/mm.h>
@@ -11,19 +9,26 @@
 #include <asm/pgtable.h>
 #include <asm/tlbflush.h>
 #include <linux/pgtable.h>
+#include <net/sock.h>
+#include <linux/netlink.h>
+#include <linux/skbuff.h>
+#include <net/net_namespace.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Reverse Engineering Expert");
-MODULE_DESCRIPTION("Android WuWa - PTE Swap Shadow Page Engine (IOCTL)");
+MODULE_DESCRIPTION("Android WuWa - Fileless Netlink Shadow Engine");
+
+/* 定义一个不与系统冲突的独立协议号 (29 通常无人使用) */
+#define NETLINK_WUWA 29 
 
 struct pte_patch_req {
     pid_t pid;
     uint64_t addr;
     uint32_t data;
 };
-#define WUWA_IOCTL_PTE_PATCH _IOW('W', 1, struct pte_patch_req)
 
-/* 异或提取纯净权限位，兼容 5.15 到 6.12 */
+struct sock *nl_sk = NULL;
+
 #ifndef pte_pgprot
 static inline pgprot_t my_pte_pgprot(pte_t pte) {
     return __pgprot(pte_val(pte) ^ pte_val(pfn_pte(pte_pfn(pte), __pgprot(0))));
@@ -31,10 +36,8 @@ static inline pgprot_t my_pte_pgprot(pte_t pte) {
 #define pte_pgprot my_pte_pgprot
 #endif
 
-/* 核心：PTE 物理层狸猫换太子 */
 static int apply_shadow_pte(pid_t pid, unsigned long vaddr, uint32_t patch_data)
 {
-    /* 【修复点】所有变量声明必须在代码执行前（适配 5.15 的老旧 C 标准） */
     struct task_struct *task;
     struct mm_struct *mm;
     pgd_t *pgd; p4d_t *p4d; pud_t *pud; pmd_t *pmd; pte_t *ptep, pte;
@@ -42,7 +45,7 @@ static int apply_shadow_pte(pid_t pid, unsigned long vaddr, uint32_t patch_data)
     void *kaddr_old, *kaddr_new;
     spinlock_t *ptl;
     int ret = -EINVAL;
-    unsigned long raw_pte; /* 提前声明 */
+    unsigned long raw_pte;
 
     rcu_read_lock();
     task = pid_task(find_vpid(pid), PIDTYPE_PID);
@@ -74,48 +77,24 @@ static int apply_shadow_pte(pid_t pid, unsigned long vaddr, uint32_t patch_data)
     if (!pte_present(pte)) { pte_unmap_unlock(ptep, ptl); goto out_unlock; }
 
     old_page = pte_page(pte);
-
     kaddr_old = kmap(old_page);
     kaddr_new = kmap(new_page);
-    
-    /* 完整克隆原物理页 */
     memcpy(kaddr_new, kaddr_old, PAGE_SIZE);
     
-    /* 直接写入机器码数据，此时依然是安全的映射地址 */
     *(uint32_t *)((char *)kaddr_new + (vaddr & ~PAGE_MASK)) = patch_data;
 
     kunmap(new_page);
     kunmap(old_page);
 
-    /* 重定向 PTE，保留所有 r-xp 等原生权限 */
     pte = mk_pte(new_page, pte_pgprot(pte));
-    
-    /* * 【核心补丁：击碎 ContPTE 限制】
-     * 强制清除第 52 位 (Contiguous bit)，避免 Linux MMU 连续页冲突。
-     * 【修复点】这里仅做赋值，不做声明！
-     */
     raw_pte = pte_val(pte);
     raw_pte &= ~(1ULL << 52); 
 
-    /* 物理层暴力覆盖，绕过内核 API 屏蔽 */
     *((volatile u64 *)ptep) = raw_pte;
-
     pte_unmap_unlock(ptep, ptl);
 
-    /* 精准同步屏障 */
-    asm volatile(
-        "dsb ish\n"
-        "tlbi vaae1is, %0\n" 
-        "tlbi vmalle1is\n"   
-        "dsb ish\n"
-        "isb\n"              
-        "ic ialluis\n"
-        "dsb ish\n"
-        "isb\n"
-        : : "r" (vaddr >> 12) : "memory");
-
+    asm volatile("dsb ish\ntlbi vaae1is, %0\ntlbi vmalle1is\ndsb ish\nisb\nic ialluis\ndsb ish\nisb\n" : : "r" (vaddr >> 12) : "memory");
     ret = 0;
-    pr_info("[kpm_shadow] PTE Swap Success! VADDR: 0x%lx, DATA: 0x%x\n", vaddr, patch_data);
 
 out_unlock:
     mmap_read_unlock(mm);
@@ -124,42 +103,43 @@ out_mm:
     mmput(mm); put_task_struct(task); return ret;
 }
 
-static long wuwa_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+/* 核心通信槽：拦截网络栈传来的假数据包 */
+static void nl_recv_msg(struct sk_buff *skb)
 {
-    if (cmd == WUWA_IOCTL_PTE_PATCH) {
-        struct pte_patch_req req;
-        if (copy_from_user(&req, (void __user *)arg, sizeof(req))) return -EFAULT;
-        return apply_shadow_pte(req.pid, req.addr, req.data);
+    struct nlmsghdr *nlh;
+    struct pte_patch_req *req;
+
+    if (skb->len >= nlmsg_total_size(0)) {
+        nlh = nlmsg_hdr(skb);
+        if (nlmsg_len(nlh) >= sizeof(struct pte_patch_req)) {
+            req = (struct pte_patch_req *)nlmsg_data(nlh);
+            /* 收到来自用户态的数据包，触发底层的影子页物理劫持 */
+            apply_shadow_pte(req->pid, req->addr, req->data);
+        }
     }
-    return -EINVAL;
 }
-
-static const struct file_operations wuwa_fops = {
-    .owner          = THIS_MODULE,
-    .unlocked_ioctl = wuwa_ioctl,
-    .compat_ioctl   = wuwa_ioctl,
-};
-
-static struct miscdevice wuwa_misc = {
-    .minor = MISC_DYNAMIC_MINOR,
-    .name  = "wuwa_core",
-    .fops  = &wuwa_fops,
-};
 
 static int __init kpm_shadow_init(void)
 {
-    int ret = misc_register(&wuwa_misc);
-    if (ret < 0) {
-        pr_err("[kpm_shadow] Failed to register device\n");
-        return ret;
+    struct netlink_kernel_cfg cfg = {
+        .input = nl_recv_msg,
+    };
+    
+    nl_sk = netlink_kernel_create(&init_net, NETLINK_WUWA, &cfg);
+    if (!nl_sk) {
+        pr_err("[kpm_shadow] Failed to create netlink socket.\n");
+        return -ENOMEM;
     }
-    pr_info("[kpm_shadow] PTE Shadow Engine Activated. /dev/wuwa_core ready.\n");
+    
+    pr_info("[kpm_shadow] Fileless Netlink Engine Activated. Listening on proto 29.\n");
     return 0;
 }
 
 static void __exit kpm_shadow_exit(void)
 {
-    misc_deregister(&wuwa_misc);
+    if (nl_sk) {
+        netlink_kernel_release(nl_sk);
+    }
     pr_info("[kpm_shadow] Engine Deactivated.\n");
 }
 
