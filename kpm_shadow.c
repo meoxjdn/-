@@ -1,7 +1,8 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
-#include <linux/kprobes.h>
+#include <linux/miscdevice.h>
+#include <linux/fs.h>
 #include <linux/sched.h>
 #include <linux/sched/mm.h>
 #include <linux/mm.h>
@@ -13,15 +14,17 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Reverse Engineering Expert");
-MODULE_DESCRIPTION("Android WuWa - PTE Swap Shadow Page Engine");
+MODULE_DESCRIPTION("Android WuWa - PTE Swap Shadow Page Engine (IOCTL)");
 
-#define PR_WXSHADOW_PATCH   0x57580006
-#define PR_WXSHADOW_RELEASE 0x57580008
+/* 驱动通信协议 */
+struct pte_patch_req {
+    pid_t pid;
+    uint64_t addr;
+    uint32_t data;
+};
+#define WUWA_IOCTL_PTE_PATCH _IOW('W', 1, struct pte_patch_req)
 
-/* 【新增】接收来自装载脚本的动态基址投喂 */
-static unsigned long p_prctl_addr = 0;
-module_param(p_prctl_addr, ulong, 0400);
-
+/* 异或剥离法获取页表属性，兼容 5.15 到 6.12 */
 #ifndef pte_pgprot
 static inline pgprot_t my_pte_pgprot(pte_t pte) {
     return __pgprot(pte_val(pte) ^ pte_val(pfn_pte(pte_pfn(pte), __pgprot(0))));
@@ -42,7 +45,8 @@ static void force_flush_tlb_icache(void)
         : : : "memory");
 }
 
-static int apply_shadow_pte(pid_t pid, unsigned long vaddr, void __user *patch_buf, size_t patch_len)
+/* 核心：PTE 物理层狸猫换太子 */
+static int apply_shadow_pte(pid_t pid, unsigned long vaddr, uint32_t patch_data)
 {
     struct task_struct *task;
     struct mm_struct *mm;
@@ -79,31 +83,30 @@ static int apply_shadow_pte(pid_t pid, unsigned long vaddr, void __user *patch_b
     if (!ptep) goto out_unlock;
     pte = *ptep;
 
-    if (!pte_present(pte)) {
-        pte_unmap_unlock(ptep, ptl);
-        goto out_unlock;
-    }
+    if (!pte_present(pte)) { pte_unmap_unlock(ptep, ptl); goto out_unlock; }
 
     old_page = pte_page(pte);
 
     kaddr_old = kmap(old_page);
     kaddr_new = kmap(new_page);
     
+    /* 完整克隆原物理页 */
     memcpy(kaddr_new, kaddr_old, PAGE_SIZE);
     
-    if (copy_from_user((char *)kaddr_new + (vaddr & ~PAGE_MASK), patch_buf, patch_len)) {
-        kunmap(new_page); kunmap(old_page); pte_unmap_unlock(ptep, ptl); goto out_unlock;
-    }
+    /* 直接写入机器码数据，零内核态权限越界风险 */
+    *(uint32_t *)((char *)kaddr_new + (vaddr & ~PAGE_MASK)) = patch_data;
 
-    kunmap(new_page); kunmap(old_page);
+    kunmap(new_page);
+    kunmap(old_page);
 
+    /* 重定向 PTE，保留所有 r-xp 等原生权限 */
     pte = mk_pte(new_page, pte_pgprot(pte));
     set_pte_at(mm, vaddr, ptep, pte);
     pte_unmap_unlock(ptep, ptl);
 
     force_flush_tlb_icache();
     ret = 0;
-    pr_info("[kpm_shadow] PTE Swap Success! PID: %d, VADDR: 0x%lx\n", pid, vaddr);
+    pr_info("[kpm_shadow] PTE Swap Success! VADDR: 0x%lx\n", vaddr);
 
 out_unlock:
     mmap_read_unlock(mm);
@@ -112,48 +115,43 @@ out_mm:
     mmput(mm); put_task_struct(task); return ret;
 }
 
-static int prctl_pre_handler(struct kprobe *p, struct pt_regs *regs)
+/* 抛弃 Kprobe，使用极致稳定的 IOCTL 通信 */
+static long wuwa_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
-    int option = (int)regs->regs[0];
-    if (option == PR_WXSHADOW_PATCH) {
-        pid_t pid = (pid_t)regs->regs[1];
-        unsigned long vaddr = regs->regs[2];
-        void __user *buf = (void __user *)regs->regs[3];
-        size_t len = (size_t)regs->regs[4];
-        apply_shadow_pte(pid, vaddr, buf, len);
+    if (cmd == WUWA_IOCTL_PTE_PATCH) {
+        struct pte_patch_req req;
+        if (copy_from_user(&req, (void __user *)arg, sizeof(req))) return -EFAULT;
+        return apply_shadow_pte(req.pid, req.addr, req.data);
     }
-    else if (option == PR_WXSHADOW_RELEASE) {
-        pr_info("[kpm_shadow] WXSHADOW_RELEASE Heartbeat OK.\n");
-    }
-    return 0; 
+    return -EINVAL;
 }
 
-/* 【修改】不再依赖 symbol_name，完全使用传进来的地址 */
-static struct kprobe kp = {
-    .pre_handler = prctl_pre_handler,
+static const struct file_operations wuwa_fops = {
+    .owner          = THIS_MODULE,
+    .unlocked_ioctl = wuwa_ioctl,
+    .compat_ioctl   = wuwa_ioctl,
+};
+
+static struct miscdevice wuwa_misc = {
+    .minor = MISC_DYNAMIC_MINOR,
+    .name  = "wuwa_core",
+    .fops  = &wuwa_fops,
 };
 
 static int __init kpm_shadow_init(void)
 {
-    int ret;
-    if (!p_prctl_addr) {
-        pr_err("[kpm_shadow] Initialization failed: prctl address not provided.\n");
-        return -EINVAL; /* 未传参直接拒绝加载 */
-    }
-
-    kp.addr = (kprobe_opcode_t *)p_prctl_addr;
-    ret = register_kprobe(&kp);
+    int ret = misc_register(&wuwa_misc);
     if (ret < 0) {
-        pr_err("[kpm_shadow] Kprobe install failed at 0x%lx: %d\n", p_prctl_addr, ret);
+        pr_err("[kpm_shadow] Failed to register device\n");
         return ret;
     }
-    pr_info("[kpm_shadow] Engine Activated. Magic prctl hijacked at 0x%lx.\n", p_prctl_addr);
+    pr_info("[kpm_shadow] PTE Shadow Engine Activated. /dev/wuwa_core ready.\n");
     return 0;
 }
 
 static void __exit kpm_shadow_exit(void)
 {
-    unregister_kprobe(&kp);
+    misc_deregister(&wuwa_misc);
     pr_info("[kpm_shadow] Engine Deactivated.\n");
 }
 
