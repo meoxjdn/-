@@ -16,7 +16,6 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Reverse Engineering Expert");
 MODULE_DESCRIPTION("Android WuWa - PTE Swap Shadow Page Engine (IOCTL)");
 
-/* 驱动通信协议 */
 struct pte_patch_req {
     pid_t pid;
     uint64_t addr;
@@ -24,7 +23,7 @@ struct pte_patch_req {
 };
 #define WUWA_IOCTL_PTE_PATCH _IOW('W', 1, struct pte_patch_req)
 
-/* 异或剥离法获取页表属性，兼容 5.15 到 6.12 */
+/* 异或提取纯净权限位 */
 #ifndef pte_pgprot
 static inline pgprot_t my_pte_pgprot(pte_t pte) {
     return __pgprot(pte_val(pte) ^ pte_val(pfn_pte(pte_pfn(pte), __pgprot(0))));
@@ -45,7 +44,6 @@ static void force_flush_tlb_icache(void)
         : : : "memory");
 }
 
-/* 核心：PTE 物理层狸猫换太子 */
 static int apply_shadow_pte(pid_t pid, unsigned long vaddr, uint32_t patch_data)
 {
     struct task_struct *task;
@@ -90,18 +88,24 @@ static int apply_shadow_pte(pid_t pid, unsigned long vaddr, uint32_t patch_data)
     kaddr_old = kmap(old_page);
     kaddr_new = kmap(new_page);
     
-    /* 完整克隆原物理页 */
     memcpy(kaddr_new, kaddr_old, PAGE_SIZE);
     
-    /* 直接写入机器码数据，零内核态权限越界风险 */
     *(uint32_t *)((char *)kaddr_new + (vaddr & ~PAGE_MASK)) = patch_data;
 
     kunmap(new_page);
     kunmap(old_page);
 
-    /* 重定向 PTE，保留所有 r-xp 等原生权限 */
+    /* 组合出新的 PTE 值 */
     pte = mk_pte(new_page, pte_pgprot(pte));
-    set_pte_at(mm, vaddr, ptep, pte);
+    
+    /* * ====================================================================
+     * 【内核拦截大杀器：Zero-API 暴力赋值】
+     * 抛弃 set_pte_at()，直接将目标 PTE 地址强转为 64 位 volatile 整数指针，
+     * 以硬件级别硬写 8 字节！完美绕过 MTE、ContPTE 等未导出符号。
+     * ====================================================================
+     */
+    *((volatile u64 *)ptep) = pte_val(pte);
+
     pte_unmap_unlock(ptep, ptl);
 
     force_flush_tlb_icache();
@@ -115,7 +119,6 @@ out_mm:
     mmput(mm); put_task_struct(task); return ret;
 }
 
-/* 抛弃 Kprobe，使用极致稳定的 IOCTL 通信 */
 static long wuwa_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
     if (cmd == WUWA_IOCTL_PTE_PATCH) {
