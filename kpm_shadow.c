@@ -23,7 +23,7 @@ struct pte_patch_req {
 };
 #define WUWA_IOCTL_PTE_PATCH _IOW('W', 1, struct pte_patch_req)
 
-/* 异或提取纯净权限位 */
+/* 异或提取纯净权限位，兼容 5.15 到 6.12 */
 #ifndef pte_pgprot
 static inline pgprot_t my_pte_pgprot(pte_t pte) {
     return __pgprot(pte_val(pte) ^ pte_val(pfn_pte(pte_pfn(pte), __pgprot(0))));
@@ -31,19 +31,7 @@ static inline pgprot_t my_pte_pgprot(pte_t pte) {
 #define pte_pgprot my_pte_pgprot
 #endif
 
-static void force_flush_tlb_icache(void)
-{
-    asm volatile(
-        "dsb ishst\n"        
-        "tlbi vmalle1is\n"   
-        "dsb ish\n"          
-        "isb\n"              
-        "ic ialluis\n"       
-        "dsb ish\n"
-        "isb\n"
-        : : : "memory");
-}
-
+/* 核心：PTE 物理层狸猫换太子 */
 static int apply_shadow_pte(pid_t pid, unsigned long vaddr, uint32_t patch_data)
 {
     struct task_struct *task;
@@ -88,29 +76,43 @@ static int apply_shadow_pte(pid_t pid, unsigned long vaddr, uint32_t patch_data)
     kaddr_old = kmap(old_page);
     kaddr_new = kmap(new_page);
     
+    /* 完整克隆原物理页 */
     memcpy(kaddr_new, kaddr_old, PAGE_SIZE);
     
+    /* 直接写入机器码数据，此时依然是安全的映射地址 */
     *(uint32_t *)((char *)kaddr_new + (vaddr & ~PAGE_MASK)) = patch_data;
 
     kunmap(new_page);
     kunmap(old_page);
 
-    /* 组合出新的 PTE 值 */
+    /* 重定向 PTE，保留所有 r-xp 等原生权限 */
     pte = mk_pte(new_page, pte_pgprot(pte));
     
-    /* * ====================================================================
-     * 【内核拦截大杀器：Zero-API 暴力赋值】
-     * 抛弃 set_pte_at()，直接将目标 PTE 地址强转为 64 位 volatile 整数指针，
-     * 以硬件级别硬写 8 字节！完美绕过 MTE、ContPTE 等未导出符号。
-     * ====================================================================
+    /* * 【核心补丁：击碎 ContPTE 限制】
+     * 强制清除第 52 位 (Contiguous bit)，避免 Linux 6.x MMU 连续页冲突
      */
-    *((volatile u64 *)ptep) = pte_val(pte);
+    unsigned long raw_pte = pte_val(pte);
+    raw_pte &= ~(1ULL << 52); 
+
+    /* 物理层暴力覆盖，绕过内核 API 屏蔽 */
+    *((volatile u64 *)ptep) = raw_pte;
 
     pte_unmap_unlock(ptep, ptl);
 
-    force_flush_tlb_icache();
+    /* 精准同步屏障 */
+    asm volatile(
+        "dsb ish\n"
+        "tlbi vaae1is, %0\n" 
+        "tlbi vmalle1is\n"   
+        "dsb ish\n"
+        "isb\n"              
+        "ic ialluis\n"
+        "dsb ish\n"
+        "isb\n"
+        : : "r" (vaddr >> 12) : "memory");
+
     ret = 0;
-    pr_info("[kpm_shadow] PTE Swap Success! VADDR: 0x%lx\n", vaddr);
+    pr_info("[kpm_shadow] PTE Swap Success! VADDR: 0x%lx, DATA: 0x%x\n", vaddr, patch_data);
 
 out_unlock:
     mmap_read_unlock(mm);
