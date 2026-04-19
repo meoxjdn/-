@@ -34,6 +34,7 @@ static inline pgprot_t my_pte_pgprot(pte_t pte) {
 /* 核心：PTE 物理层狸猫换太子 */
 static int apply_shadow_pte(pid_t pid, unsigned long vaddr, uint32_t patch_data)
 {
+    /* 【修复点】所有变量声明必须在代码执行前（适配 5.15 的老旧 C 标准） */
     struct task_struct *task;
     struct mm_struct *mm;
     pgd_t *pgd; p4d_t *p4d; pud_t *pud; pmd_t *pmd; pte_t *ptep, pte;
@@ -41,6 +42,7 @@ static int apply_shadow_pte(pid_t pid, unsigned long vaddr, uint32_t patch_data)
     void *kaddr_old, *kaddr_new;
     spinlock_t *ptl;
     int ret = -EINVAL;
+    unsigned long raw_pte; /* 提前声明 */
 
     rcu_read_lock();
     task = pid_task(find_vpid(pid), PIDTYPE_PID);
@@ -89,9 +91,10 @@ static int apply_shadow_pte(pid_t pid, unsigned long vaddr, uint32_t patch_data)
     pte = mk_pte(new_page, pte_pgprot(pte));
     
     /* * 【核心补丁：击碎 ContPTE 限制】
-     * 强制清除第 52 位 (Contiguous bit)，避免 Linux 6.x MMU 连续页冲突
+     * 强制清除第 52 位 (Contiguous bit)，避免 Linux MMU 连续页冲突。
+     * 【修复点】这里仅做赋值，不做声明！
      */
-    unsigned long raw_pte = pte_val(pte);
+    raw_pte = pte_val(pte);
     raw_pte &= ~(1ULL << 52); 
 
     /* 物理层暴力覆盖，绕过内核 API 屏蔽 */
