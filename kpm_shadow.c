@@ -58,8 +58,10 @@ static uint64_t g_target_vaddr = 0;
 static uint64_t g_orig_pfn = 0;
 static uint64_t g_shadow_pfn = 0;
 static struct mm_struct *g_game_mm = NULL;
-static uint8_t g_trampoline_escape_pod[32]; 
 static bool g_kernel_hooked = false;
+
+/* 【核心修复】：删除 static，将逃逸舱暴露为全局符号，供汇编指令 ldr 调用 */
+uint8_t g_trampoline_escape_pod[32]; 
 
 #ifndef pte_pgprot
 static inline pgprot_t my_pte_pgprot(pte_t pte) {
@@ -87,7 +89,6 @@ static void force_flush_tlb_page(unsigned long vaddr) {
 }
 
 int my_fault_dispatcher(unsigned long addr, unsigned int esr, struct pt_regs *regs) {
-    /* 严格遵守 C90 标准，所有变量全部在函数最顶端声明 */
     unsigned int ec;
     pte_t *ptep;
     unsigned long raw_pte;
@@ -166,7 +167,6 @@ __attribute__((naked)) void my_fault_trampoline(void) {
 }
 
 static int inject_and_setup_rx(struct rx_patch_req *req) {
-    /* 严格遵守 C90 标准，所有变量全部在函数最顶端声明 */
     struct task_struct *task;
     struct mm_struct *mm;
     struct page *orig_page, *shadow_page, *new_kpage;
@@ -212,7 +212,6 @@ static int inject_and_setup_rx(struct rx_patch_req *req) {
     kunmap(shadow_page);
     kunmap(orig_page);
 
-    /* 变量赋值区 */
     raw_game_pte = pte_val(*game_ptep);
     raw_game_pte |= PTE_USER_XN;
     *((volatile u64 *)game_ptep) = raw_game_pte;
