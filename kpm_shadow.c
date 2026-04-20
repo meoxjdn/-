@@ -25,11 +25,27 @@ static unsigned long long k_init_mm = 0;
 module_param(k_init_mm, ullong, 0444);
 
 #define NETLINK_WUWA 29 
+
+/* --- 宏定义护盾：完美适配 Android 15 (6.6) 新内核 --- */
+#ifndef ESR_ELx_EC_SHIFT
 #define ESR_ELx_EC_SHIFT    26
+#endif
+
+#ifndef EC_INSN_ABORT_L
 #define EC_INSN_ABORT_L     0x20  
+#endif
+
+#ifndef EC_DATA_ABORT_L
 #define EC_DATA_ABORT_L     0x24  
+#endif
+
+#ifndef PTE_USER_XN
 #define PTE_USER_XN      (1ULL << 54) 
+#endif
+
+#ifndef PTE_AP_READ_ONLY
 #define PTE_AP_READ_ONLY (3ULL << 6)  
+#endif
 
 struct rx_patch_req {
     pid_t pid;
