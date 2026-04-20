@@ -26,7 +26,7 @@ module_param(k_init_mm, ullong, 0444);
 
 #define NETLINK_WUWA 29 
 
-/* --- 宏定义护盾：完美适配 Android 15 (6.6) 新内核 --- */
+/* --- 宏定义护盾：完美适配新老内核 --- */
 #ifndef ESR_ELx_EC_SHIFT
 #define ESR_ELx_EC_SHIFT    26
 #endif
@@ -87,16 +87,20 @@ static void force_flush_tlb_page(unsigned long vaddr) {
 }
 
 int my_fault_dispatcher(unsigned long addr, unsigned int esr, struct pt_regs *regs) {
+    /* 严格遵守 C90 标准，所有变量全部在函数最顶端声明 */
+    unsigned int ec;
+    pte_t *ptep;
+    unsigned long raw_pte;
+    pte_t new_pte;
+
     if (!g_target_vaddr || (addr & PAGE_MASK) != (g_target_vaddr & PAGE_MASK)) return 0; 
 
-    unsigned int ec = esr >> ESR_ELx_EC_SHIFT;
-    pte_t *ptep = get_pte_ptr(g_game_mm, g_target_vaddr);
+    ec = esr >> ESR_ELx_EC_SHIFT;
+    ptep = get_pte_ptr(g_game_mm, g_target_vaddr);
     if (!ptep) return 0;
 
-    unsigned long raw_pte;
-
     if (ec == EC_INSN_ABORT_L) {
-        pte_t new_pte = pfn_pte(g_shadow_pfn, pte_pgprot(*ptep));
+        new_pte = pfn_pte(g_shadow_pfn, pte_pgprot(*ptep));
         raw_pte = pte_val(new_pte);
         raw_pte &= ~PTE_USER_XN;       
         raw_pte &= ~(1ULL << 52);      
@@ -104,7 +108,7 @@ int my_fault_dispatcher(unsigned long addr, unsigned int esr, struct pt_regs *re
         force_flush_tlb_page(g_target_vaddr);
         return 1;
     } else if (ec == EC_DATA_ABORT_L) {
-        pte_t new_pte = pfn_pte(g_orig_pfn, pte_pgprot(*ptep));
+        new_pte = pfn_pte(g_orig_pfn, pte_pgprot(*ptep));
         raw_pte = pte_val(new_pte);
         raw_pte |= PTE_USER_XN;        
         raw_pte |= PTE_AP_READ_ONLY;   
@@ -162,12 +166,18 @@ __attribute__((naked)) void my_fault_trampoline(void) {
 }
 
 static int inject_and_setup_rx(struct rx_patch_req *req) {
+    /* 严格遵守 C90 标准，所有变量全部在函数最顶端声明 */
     struct task_struct *task;
     struct mm_struct *mm;
     struct page *orig_page, *shadow_page, *new_kpage;
     void *kaddr_orig, *kaddr_shadow, *kaddr_new_kernel;
     pte_t *game_ptep, *kernel_ptep;
     unsigned long flags;
+    unsigned long raw_game_pte;
+    unsigned long offset;
+    uint32_t *patch_addr;
+    uint32_t *escape_tail;
+    unsigned long raw_kpte;
 
     if (!k_do_fault || !k_init_mm) {
         pr_err("[RX] Kernel pointers missing!\n");
@@ -202,7 +212,8 @@ static int inject_and_setup_rx(struct rx_patch_req *req) {
     kunmap(shadow_page);
     kunmap(orig_page);
 
-    unsigned long raw_game_pte = pte_val(*game_ptep);
+    /* 变量赋值区 */
+    raw_game_pte = pte_val(*game_ptep);
     raw_game_pte |= PTE_USER_XN;
     *((volatile u64 *)game_ptep) = raw_game_pte;
     force_flush_tlb_page(g_target_vaddr);
@@ -215,12 +226,12 @@ static int inject_and_setup_rx(struct rx_patch_req *req) {
         kaddr_new_kernel = page_address(new_kpage);
         memcpy(kaddr_new_kernel, (void *)(k_do_fault & PAGE_MASK), PAGE_SIZE);
 
-        unsigned long offset = k_do_fault & ~PAGE_MASK;
-        uint32_t *patch_addr = (uint32_t *)((char *)kaddr_new_kernel + offset);
+        offset = k_do_fault & ~PAGE_MASK;
+        patch_addr = (uint32_t *)((char *)kaddr_new_kernel + offset);
         
         memcpy(g_trampoline_escape_pod, patch_addr, 16);
         
-        uint32_t *escape_tail = (uint32_t *)(g_trampoline_escape_pod + 16);
+        escape_tail = (uint32_t *)(g_trampoline_escape_pod + 16);
         escape_tail[0] = 0x58000050; 
         escape_tail[1] = 0xD61F0200; 
         *((uint64_t *)&escape_tail[2]) = k_do_fault + 16;
@@ -229,7 +240,7 @@ static int inject_and_setup_rx(struct rx_patch_req *req) {
         patch_addr[1] = 0xD61F0200; 
         *((uint64_t *)&patch_addr[2]) = (uint64_t)my_fault_trampoline;
 
-        unsigned long raw_kpte = pte_val(pfn_pte(page_to_pfn(new_kpage), pte_pgprot(*kernel_ptep)));
+        raw_kpte = pte_val(pfn_pte(page_to_pfn(new_kpage), pte_pgprot(*kernel_ptep)));
         raw_kpte &= ~(1ULL << 52); 
 
         local_irq_save(flags); 
