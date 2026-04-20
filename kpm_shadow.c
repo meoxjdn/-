@@ -16,7 +16,7 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("RX_Engine");
-MODULE_DESCRIPTION("Dynamic R^X Shadow Page Engine V3");
+MODULE_DESCRIPTION("Dynamic R^X Shadow Page Engine V4");
 
 static unsigned long long k_do_fault = 0;
 module_param(k_do_fault, ullong, 0444);
@@ -38,9 +38,11 @@ module_param(k_init_mm, ullong, 0444);
 #ifndef PTE_USER_XN
 #define PTE_USER_XN      (1ULL << 54) 
 #endif
-#ifndef PTE_AP_READ_ONLY
-#define PTE_AP_READ_ONLY (3ULL << 6)  
-#endif
+
+/* ARM64 权限位定义 */
+#define PTE_AP_EL0_RO    (3ULL << 6)  // EL0 只读
+#define PTE_AP_EL0_NONE  (0ULL << 6)  // EL0 无读写权限 (配合 UXN=0 可实现只执行)
+#define PTE_GP_BIT       (1ULL << 50) // BTI Guarded Page 位
 
 struct rx_patch_req {
     pid_t pid;
@@ -55,8 +57,10 @@ static uint64_t g_shadow_pfn = 0;
 static struct mm_struct *g_game_mm = NULL;
 static bool g_kernel_hooked = false;
 
-/* 防递归死机锁：每个 CPU 核心独立保存状态 */
+/* 防递归死机锁 */
 static DEFINE_PER_CPU(int, g_in_hook);
+
+uint8_t g_trampoline_escape_pod[32]; 
 
 #ifndef pte_pgprot
 static inline pgprot_t my_pte_pgprot(pte_t pte) {
@@ -64,14 +68,6 @@ static inline pgprot_t my_pte_pgprot(pte_t pte) {
 }
 #define pte_pgprot my_pte_pgprot
 #endif
-
-/* 魔法逃逸舱：在代码段中硬开辟的纯执行空间，免疫 PXN 异常 */
-__attribute__((naked)) void my_escape_pod(void) {
-    asm volatile(
-        "nop\nnop\nnop\nnop\n"
-        "nop\nnop\nnop\nnop\n"
-    );
-}
 
 static pte_t* get_pte_ptr(struct mm_struct *mm, unsigned long vaddr) {
     pgd_t *pgd; p4d_t *p4d; pud_t *pud; pmd_t *pmd; pte_t *ptep;
@@ -100,7 +96,6 @@ int my_fault_dispatcher(unsigned long addr, unsigned int esr, struct pt_regs *re
 
     if (!g_target_vaddr || (addr & PAGE_MASK) != (g_target_vaddr & PAGE_MASK)) return 0; 
 
-    /* 防死机护盾：如果当前核心已经在处理异常，直接放行，避免无限套娃 */
     hook_flag = this_cpu_ptr(&g_in_hook);
     if (*hook_flag) return 0;
     *hook_flag = 1;
@@ -115,9 +110,11 @@ int my_fault_dispatcher(unsigned long addr, unsigned int esr, struct pt_regs *re
     if (ec == EC_INSN_ABORT_L) {
         new_pte = pfn_pte(g_shadow_pfn, pte_pgprot(*ptep));
         raw_pte = pte_val(new_pte);
-        raw_pte &= ~PTE_USER_XN;       // 给执行权限
-        raw_pte |= PTE_AP_READ_ONLY;   // 【兼容性降维】暂时保留读取，防止硬件死锁
+        /* 影子页：授予执行权限，彻底剥夺读取权限 (Execute-Only) */
+        raw_pte &= ~PTE_USER_XN;       
+        raw_pte &= ~(3ULL << 6);       // 清空 AP 位 (等同于 PTE_AP_EL0_NONE)
         raw_pte &= ~(1ULL << 52);      
+        raw_pte &= ~PTE_GP_BIT;        // 绕过 BTI 异常
         *((volatile u64 *)ptep) = raw_pte;
         force_flush_tlb_page(g_target_vaddr);
         *hook_flag = 0;
@@ -125,9 +122,12 @@ int my_fault_dispatcher(unsigned long addr, unsigned int esr, struct pt_regs *re
     } else if (ec == EC_DATA_ABORT_L) {
         new_pte = pfn_pte(g_orig_pfn, pte_pgprot(*ptep));
         raw_pte = pte_val(new_pte);
-        raw_pte |= PTE_USER_XN;        // 剥夺执行权限
-        raw_pte |= PTE_AP_READ_ONLY;   // 给读取权限
+        /* 原版页：授予只读权限，彻底剥夺执行权限 (Read-Only) */
+        raw_pte |= PTE_USER_XN;        
+        raw_pte &= ~(3ULL << 6);       // 先清空
+        raw_pte |= PTE_AP_EL0_RO;      // 赋只读
         raw_pte &= ~(1ULL << 52);
+        raw_pte &= ~PTE_GP_BIT;
         *((volatile u64 *)ptep) = raw_pte;
         force_flush_tlb_page(g_target_vaddr);
         *hook_flag = 0;
@@ -151,9 +151,13 @@ __attribute__((naked)) void my_fault_trampoline(void) {
         "stp x16, x17, [sp, #-16]!\n"
         "stp x18, x19, [sp, #-16]!\n"
         "stp x29, x30, [sp, #-16]!\n"
+        
         "bl my_fault_dispatcher\n"
+        
         "cmp x0, #1\n"
         "b.eq .L_handled\n"
+        
+        /* 拦截失败，执行原函数逻辑 */
         "ldp x29, x30, [sp], #16\n"
         "ldp x18, x19, [sp], #16\n"
         "ldp x16, x17, [sp], #16\n"
@@ -165,9 +169,11 @@ __attribute__((naked)) void my_fault_trampoline(void) {
         "ldp x4, x5, [sp], #16\n"
         "ldp x2, x3, [sp], #16\n"
         "ldp x0, x1, [sp], #16\n"
-        "ldr x16, =my_escape_pod\n" // 指向免疫 PXN 的代码段逃逸舱
+        "ldr x16, =g_trampoline_escape_pod\n" 
         "br x16\n"
+        
         ".L_handled:\n"
+        /* 拦截成功，当作无事发生，使用 C 函数的 ret 安全返回 entry.S，切勿使用 eret！ */
         "ldp x29, x30, [sp], #16\n"
         "ldp x18, x19, [sp], #16\n"
         "ldp x16, x17, [sp], #16\n"
@@ -179,24 +185,23 @@ __attribute__((naked)) void my_fault_trampoline(void) {
         "ldp x4, x5, [sp], #16\n"
         "ldp x2, x3, [sp], #16\n"
         "ldp x0, x1, [sp], #16\n"
-        "eret\n" 
+        "ret\n" // <--- 【救命修复】普通 C 函数返回，完美保全内核堆栈！
     );
 }
 
 static int inject_and_setup_rx(struct rx_patch_req *req) {
     struct task_struct *task;
     struct mm_struct *mm;
-    struct page *orig_page, *shadow_page, *new_kpage, *pod_page;
-    void *kaddr_orig, *kaddr_shadow, *kaddr_new_kernel, *pod_kaddr;
-    pte_t *game_ptep, *kernel_ptep, *pod_ptep;
+    struct page *orig_page, *shadow_page, *new_kpage;
+    void *kaddr_orig, *kaddr_shadow, *kaddr_new_kernel;
+    pte_t *game_ptep, *kernel_ptep;
     unsigned long flags;
     unsigned long raw_game_pte;
     unsigned long offset;
     uint32_t *patch_addr;
-    uint32_t *pod_ptr;
+    uint32_t *escape_tail;
     unsigned long raw_kpte;
 
-    /* 清理模式检测 */
     if (req->addr == 0) {
         if (g_target_vaddr && g_game_mm) {
             game_ptep = get_pte_ptr(g_game_mm, g_target_vaddr);
@@ -242,30 +247,14 @@ static int inject_and_setup_rx(struct rx_patch_req *req) {
     kunmap(shadow_page);
     kunmap(orig_page);
 
+    /* 默认初始设置为：不可执行（逼迫游戏执行时触发异常进入我们的钩子） */
     raw_game_pte = pte_val(*game_ptep);
     raw_game_pte |= PTE_USER_XN;
+    raw_game_pte &= ~PTE_GP_BIT; // 去除游戏页的 BTI 保护
     *((volatile u64 *)game_ptep) = raw_game_pte;
     force_flush_tlb_page(g_target_vaddr);
 
     if (!g_kernel_hooked) {
-        /* 魔法写保护击穿：将汇编代码强制写入自身的代码段逃逸舱 */
-        pod_ptep = get_pte_ptr((struct mm_struct *)k_init_mm, (unsigned long)my_escape_pod);
-        if (pod_ptep) {
-            pod_page = pte_page(*pod_ptep);
-            pod_kaddr = kmap(pod_page);
-            offset = (unsigned long)my_escape_pod & ~PAGE_MASK;
-            pod_ptr = (uint32_t *)((char *)pod_kaddr + offset);
-            
-            memcpy(pod_ptr, (void *)k_do_fault, 16);
-            pod_ptr[4] = 0x58000050; // LDR X16, #8
-            pod_ptr[5] = 0xD61F0200; // BR X16
-            *((uint64_t *)&pod_ptr[6]) = k_do_fault + 16;
-            
-            kunmap(pod_page);
-            force_flush_tlb_page((unsigned long)my_escape_pod);
-        }
-
-        /* 开始常规的内核拦截跳板搭建 */
         kernel_ptep = get_pte_ptr((struct mm_struct *)k_init_mm, k_do_fault);
         if (!kernel_ptep) goto out;
 
@@ -276,12 +265,20 @@ static int inject_and_setup_rx(struct rx_patch_req *req) {
         offset = k_do_fault & ~PAGE_MASK;
         patch_addr = (uint32_t *)((char *)kaddr_new_kernel + offset);
         
+        memcpy(g_trampoline_escape_pod, patch_addr, 16);
+        
+        escape_tail = (uint32_t *)(g_trampoline_escape_pod + 16);
+        escape_tail[0] = 0x58000050; 
+        escape_tail[1] = 0xD61F0200; 
+        *((uint64_t *)&escape_tail[2]) = k_do_fault + 16;
+
         patch_addr[0] = 0x58000050; 
         patch_addr[1] = 0xD61F0200; 
         *((uint64_t *)&patch_addr[2]) = (uint64_t)my_fault_trampoline;
 
         raw_kpte = pte_val(pfn_pte(page_to_pfn(new_kpage), pte_pgprot(*kernel_ptep)));
         raw_kpte &= ~(1ULL << 52); 
+        raw_kpte &= ~PTE_GP_BIT; // 去除内核跳板的 BTI 保护
 
         local_irq_save(flags); 
         *((volatile u64 *)kernel_ptep) = raw_kpte;
@@ -289,7 +286,7 @@ static int inject_and_setup_rx(struct rx_patch_req *req) {
         local_irq_restore(flags); 
         
         g_kernel_hooked = true;
-        pr_info("[RX] Kernel Hook Injected with Safe Pod\n");
+        pr_info("[RX] Kernel Hook Injected Successfully.\n");
     }
 
 out:
