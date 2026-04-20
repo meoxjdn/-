@@ -26,21 +26,45 @@ module_param(k_init_mm, ullong, 0444);
 
 #define NETLINK_WUWA 29 
 
-/* 异常向量症状解析 */
+/* --- 异常向量症状解析 (带防重定义护盾) --- */
+#ifndef ESR_ELx_EC_SHIFT
 #define ESR_ELx_EC_SHIFT    26
+#endif
+#ifndef EC_INSN_ABORT_L
 #define EC_INSN_ABORT_L     0x20  
+#endif
+#ifndef EC_DATA_ABORT_L
 #define EC_DATA_ABORT_L     0x24  
+#endif
 
-/* KPM 级别的 ARM64 PTE 魔法标志位 */
+/* --- KPM 级别的 ARM64 PTE 魔法标志位 (带防重定义护盾) --- */
+#ifndef PTE_VALID
 #define PTE_VALID        (1ULL << 0)
+#endif
+#ifndef PTE_TYPE_PAGE
 #define PTE_TYPE_PAGE    (3ULL << 0)
+#endif
+#ifndef PTE_USER
 #define PTE_USER         (1ULL << 6)   // AP[1]
+#endif
+#ifndef PTE_RDONLY
 #define PTE_RDONLY       (1ULL << 7)   // AP[2]
+#endif
+#ifndef PTE_AF
 #define PTE_AF           (1ULL << 10)
+#endif
+#ifndef PTE_NG
 #define PTE_NG           (1ULL << 11)
+#endif
+#ifndef PTE_PXN
 #define PTE_PXN          (1ULL << 53)
+#endif
+#ifndef PTE_UXN
 #define PTE_UXN          (1ULL << 54)
+#endif
+#ifndef PTE_GP_BIT
 #define PTE_GP_BIT       (1ULL << 50)  // BTI 保护
+#endif
 
 struct rx_patch_req {
     pid_t pid;
@@ -104,6 +128,7 @@ static pte_t* get_user_pte_safe(struct mm_struct *mm, unsigned long vaddr) {
 /* ---------------- 缺页调度器 ---------------- */
 
 int my_fault_dispatcher(unsigned long addr, unsigned int esr, struct pt_regs *regs) {
+    /* 严格遵守 C90 标准，变量置顶 */
     unsigned int ec;
     pte_t *ptep;
     u64 entry;
@@ -126,14 +151,14 @@ int my_fault_dispatcher(unsigned long addr, unsigned int esr, struct pt_regs *re
         /* 【KPM 影子页模式】：AP=0 (禁止读写), UXN=0 (允许执行) */
         entry = make_pte(g_shadow_pfn, 0); 
         *((volatile u64 *)ptep) = entry;
-        kpm_tlbi_page(g_target_vaddr); // 精准刷新
+        kpm_tlbi_page(g_target_vaddr); 
         *hook_flag = 0;
         return 1;
     } else if (ec == EC_DATA_ABORT_L) {
         /* 【KPM 原版页模式】：AP=3 (允许读写), UXN=1 (禁止执行) */
         entry = make_pte(g_orig_pfn, PTE_USER | PTE_RDONLY | PTE_UXN);
         *((volatile u64 *)ptep) = entry;
-        kpm_tlbi_page(g_target_vaddr); // 精准刷新
+        kpm_tlbi_page(g_target_vaddr); 
         *hook_flag = 0;
         return 1;
     }
@@ -195,6 +220,7 @@ __attribute__((naked)) void my_fault_trampoline(void) {
 /* ---------------- 致命注射与引擎初始化 ---------------- */
 
 static int inject_and_setup_rx(struct rx_patch_req *req) {
+    /* 严格遵守 C90 标准，所有变量置顶声明 */
     struct task_struct *task;
     struct mm_struct *mm;
     struct page *orig_page, *shadow_page, *new_kpage;
@@ -203,6 +229,7 @@ static int inject_and_setup_rx(struct rx_patch_req *req) {
     unsigned long flags, offset;
     uint32_t *patch_addr, *escape_tail;
     u64 entry;
+    u64 raw_kpte;
 
     /* 清理还原逻辑 */
     if (req->addr == 0) {
@@ -255,7 +282,7 @@ static int inject_and_setup_rx(struct rx_patch_req *req) {
     kpm_tlbi_page(g_target_vaddr);
 
     if (!g_kernel_hooked) {
-        kernel_ptep = pte_offset_kernel((pmd_t *)k_init_mm, k_do_fault); // 简化内核页表查找
+        kernel_ptep = pte_offset_kernel((pmd_t *)k_init_mm, k_do_fault); 
         if (!kernel_ptep) goto out;
 
         new_kpage = alloc_page(GFP_KERNEL | __GFP_ZERO);
@@ -276,7 +303,7 @@ static int inject_and_setup_rx(struct rx_patch_req *req) {
         patch_addr[2] = 0xD61F0200; 
         *((uint64_t *)&patch_addr[3]) = (uint64_t)my_fault_trampoline;
 
-        u64 raw_kpte = (page_to_pfn(new_kpage) << PAGE_SHIFT) | (pte_val(*kernel_ptep) & 0x0000FFFFFFFFF000UL) | PTE_VALID | PTE_AF | PTE_NG;
+        raw_kpte = (page_to_pfn(new_kpage) << PAGE_SHIFT) | (pte_val(*kernel_ptep) & 0x0000FFFFFFFFF000UL) | PTE_VALID | PTE_AF | PTE_NG;
         raw_kpte &= ~(1ULL << 52); 
 
         local_irq_save(flags); 
