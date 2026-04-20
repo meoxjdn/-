@@ -16,7 +16,7 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("RX_Engine");
-MODULE_DESCRIPTION("KPM-Derived Standalone R^X Engine");
+MODULE_DESCRIPTION("KPM-Derived Standalone R^X Engine V5");
 
 static unsigned long long k_do_fault = 0;
 module_param(k_do_fault, ullong, 0444);
@@ -26,7 +26,6 @@ module_param(k_init_mm, ullong, 0444);
 
 #define NETLINK_WUWA 29 
 
-/* --- 异常向量症状解析 (带防重定义护盾) --- */
 #ifndef ESR_ELx_EC_SHIFT
 #define ESR_ELx_EC_SHIFT    26
 #endif
@@ -36,8 +35,6 @@ module_param(k_init_mm, ullong, 0444);
 #ifndef EC_DATA_ABORT_L
 #define EC_DATA_ABORT_L     0x24  
 #endif
-
-/* --- KPM 级别的 ARM64 PTE 魔法标志位 (带防重定义护盾) --- */
 #ifndef PTE_VALID
 #define PTE_VALID        (1ULL << 0)
 #endif
@@ -45,10 +42,10 @@ module_param(k_init_mm, ullong, 0444);
 #define PTE_TYPE_PAGE    (3ULL << 0)
 #endif
 #ifndef PTE_USER
-#define PTE_USER         (1ULL << 6)   // AP[1]
+#define PTE_USER         (1ULL << 6)   
 #endif
 #ifndef PTE_RDONLY
-#define PTE_RDONLY       (1ULL << 7)   // AP[2]
+#define PTE_RDONLY       (1ULL << 7)   
 #endif
 #ifndef PTE_AF
 #define PTE_AF           (1ULL << 10)
@@ -63,7 +60,7 @@ module_param(k_init_mm, ullong, 0444);
 #define PTE_UXN          (1ULL << 54)
 #endif
 #ifndef PTE_GP_BIT
-#define PTE_GP_BIT       (1ULL << 50)  // BTI 保护
+#define PTE_GP_BIT       (1ULL << 50)  
 #endif
 
 struct rx_patch_req {
@@ -79,32 +76,33 @@ static uint64_t g_shadow_pfn = 0;
 static struct mm_struct *g_game_mm = NULL;
 static bool g_kernel_hooked = false;
 
-/* 防并发套娃锁 */
 static DEFINE_PER_CPU(int, g_in_hook);
 
-uint8_t g_trampoline_escape_pod[32]; 
+/* * 【核武级修复】：纯正的 .text 代码段逃逸舱！
+ * 这里的指令内存天然具有可执行权限，免疫 PXN 异常！
+ */
+__attribute__((naked)) void my_escape_pod(void) {
+    asm volatile(
+        "nop\nnop\nnop\nnop\n"
+        "nop\nnop\nnop\nnop\n"
+        "nop\nnop\nnop\nnop\n"
+    );
+}
 
-/* ---------------- KPM 级底层核心函数 ---------------- */
-
-/* 狙击级 TLB 刷新：仅刷新目标虚拟地址，无损耗不死机 */
 static inline void kpm_tlbi_page(unsigned long uaddr) {
     asm volatile(
         "dsb ishst\n"
-        "tlbi vaale1is, %0\n"  /* 核心魔法：广播刷新所有 ASID 的指定 VA */
+        "tlbi vaale1is, %0\n"
         "dsb ish\n"
         "isb\n"
         : : "r"(uaddr >> 12) : "memory"
     );
 }
 
-/* 构建完美 PTE 的核心工厂 */
 static u64 make_pte(unsigned long pfn, u64 prot) {
-    /* 注入必须的硬件标志位：AF(访问位), 共享, NG(非全局) */
-    u64 entry = (pfn << PAGE_SHIFT) | prot | PTE_VALID | PTE_TYPE_PAGE | PTE_AF | (3ULL << 8) | PTE_NG;
-    return entry;
+    return (pfn << PAGE_SHIFT) | prot | PTE_VALID | PTE_TYPE_PAGE | PTE_AF | (3ULL << 8) | PTE_NG;
 }
 
-/* 安全获取用户态 PTE，防止遇上 2MB 大页内存导致崩溃 */
 static pte_t* get_user_pte_safe(struct mm_struct *mm, unsigned long vaddr) {
     pgd_t *pgd; p4d_t *p4d; pud_t *pud; pmd_t *pmd; pte_t *ptep;
     pgd = pgd_offset(mm, vaddr);
@@ -116,19 +114,13 @@ static pte_t* get_user_pte_safe(struct mm_struct *mm, unsigned long vaddr) {
     pmd = pmd_offset(pud, vaddr);
     if (pmd_none(*pmd)) return NULL;
     
-    /* 防崩溃核心：检测是否是 Huge Page (块映射) */
-    if ((pte_val(*(pte_t*)pmd) & 3) == 1) {
-        return NULL; // KPM 源码提示：遇到块映射必须先 split，这里简化处理直接拒绝
-    }
+    if ((pte_val(*(pte_t*)pmd) & 3) == 1) return NULL; 
     
     ptep = pte_offset_map(pmd, vaddr);
     return ptep;
 }
 
-/* ---------------- 缺页调度器 ---------------- */
-
 int my_fault_dispatcher(unsigned long addr, unsigned int esr, struct pt_regs *regs) {
-    /* 严格遵守 C90 标准，变量置顶 */
     unsigned int ec;
     pte_t *ptep;
     u64 entry;
@@ -148,14 +140,12 @@ int my_fault_dispatcher(unsigned long addr, unsigned int esr, struct pt_regs *re
     }
 
     if (ec == EC_INSN_ABORT_L) {
-        /* 【KPM 影子页模式】：AP=0 (禁止读写), UXN=0 (允许执行) */
         entry = make_pte(g_shadow_pfn, 0); 
         *((volatile u64 *)ptep) = entry;
         kpm_tlbi_page(g_target_vaddr); 
         *hook_flag = 0;
         return 1;
     } else if (ec == EC_DATA_ABORT_L) {
-        /* 【KPM 原版页模式】：AP=3 (允许读写), UXN=1 (禁止执行) */
         entry = make_pte(g_orig_pfn, PTE_USER | PTE_RDONLY | PTE_UXN);
         *((volatile u64 *)ptep) = entry;
         kpm_tlbi_page(g_target_vaddr); 
@@ -166,8 +156,6 @@ int my_fault_dispatcher(unsigned long addr, unsigned int esr, struct pt_regs *re
     *hook_flag = 0;
     return 0;
 }
-
-/* ---------------- 物理跳板 (修复返回逻辑) ---------------- */
 
 __attribute__((naked)) void my_fault_trampoline(void) {
     asm volatile(
@@ -198,7 +186,7 @@ __attribute__((naked)) void my_fault_trampoline(void) {
         "ldp x4, x5, [sp], #16\n"
         "ldp x2, x3, [sp], #16\n"
         "ldp x0, x1, [sp], #16\n"
-        "ldr x16, =g_trampoline_escape_pod\n" 
+        "ldr x16, =my_escape_pod\n" // <--- 【修复点】：跳向合法代码段，永不死机！
         "br x16\n"
         
         ".L_handled:\n"
@@ -213,30 +201,25 @@ __attribute__((naked)) void my_fault_trampoline(void) {
         "ldp x4, x5, [sp], #16\n"
         "ldp x2, x3, [sp], #16\n"
         "ldp x0, x1, [sp], #16\n"
-        "ret\n" /* 安全返回 */
+        "ret\n"
     );
 }
 
-/* ---------------- 致命注射与引擎初始化 ---------------- */
-
 static int inject_and_setup_rx(struct rx_patch_req *req) {
-    /* 严格遵守 C90 标准，所有变量置顶声明 */
     struct task_struct *task;
     struct mm_struct *mm;
-    struct page *orig_page, *shadow_page, *new_kpage;
-    void *kaddr_orig, *kaddr_shadow, *kaddr_new_kernel;
-    pte_t *game_ptep, *kernel_ptep;
-    unsigned long flags, offset;
-    uint32_t *patch_addr, *escape_tail;
-    u64 entry;
-    u64 raw_kpte;
+    struct page *orig_page, *shadow_page, *new_kpage, *pod_page;
+    void *kaddr_orig, *kaddr_shadow, *kaddr_new_kernel, *pod_kaddr;
+    pte_t *game_ptep, *kernel_ptep, *pod_ptep;
+    unsigned long flags, offset, pod_offset;
+    uint32_t *patch_addr, *pod_ptr, *orig_ptr;
+    u64 entry, raw_kpte;
 
-    /* 清理还原逻辑 */
     if (req->addr == 0) {
         if (g_target_vaddr && g_game_mm) {
             game_ptep = get_user_pte_safe(g_game_mm, g_target_vaddr);
             if (game_ptep) {
-                entry = make_pte(g_orig_pfn, PTE_USER | PTE_UXN); // 还原正常状态
+                entry = make_pte(g_orig_pfn, PTE_USER | PTE_UXN); 
                 *((volatile u64 *)game_ptep) = entry;
                 kpm_tlbi_page(g_target_vaddr);
             }
@@ -247,6 +230,16 @@ static int inject_and_setup_rx(struct rx_patch_req *req) {
     }
 
     if (!k_do_fault || !k_init_mm) return -EINVAL;
+
+    /* 【修复点】：防连点双重注入覆盖保护 */
+    if (g_target_vaddr == req->addr && g_shadow_pfn != 0) {
+        kaddr_shadow = kmap(pfn_to_page(g_shadow_pfn));
+        *(uint32_t *)((char *)kaddr_shadow + (g_target_vaddr & ~PAGE_MASK)) = req->data;
+        kunmap(pfn_to_page(g_shadow_pfn));
+        kpm_tlbi_page(g_target_vaddr);
+        pr_info("[RX] Updated data for existing target.\n");
+        return 0;
+    }
 
     rcu_read_lock();
     task = pid_task(find_vpid(req->pid), PIDTYPE_PID);
@@ -276,12 +269,34 @@ static int inject_and_setup_rx(struct rx_patch_req *req) {
     kunmap(shadow_page);
     kunmap(orig_page);
 
-    /* 初始化触发雷管：剥夺执行权限，使其立刻触发异常 */
     entry = make_pte(g_orig_pfn, PTE_USER | PTE_RDONLY | PTE_UXN);
     *((volatile u64 *)game_ptep) = entry;
     kpm_tlbi_page(g_target_vaddr);
 
     if (!g_kernel_hooked) {
+        /* 【核武级修复】：强行物理改写代码段逃逸舱，突破只读保护 */
+        pod_ptep = pte_offset_kernel((pmd_t *)k_init_mm, (unsigned long)my_escape_pod);
+        if (pod_ptep) {
+            pod_page = pte_page(*pod_ptep);
+            pod_kaddr = kmap(pod_page);
+            pod_offset = (unsigned long)my_escape_pod & ~PAGE_MASK;
+            pod_ptr = (uint32_t *)((char *)pod_kaddr + pod_offset);
+            orig_ptr = (uint32_t *)(k_do_fault & ~3UL);
+            
+            pod_ptr[0] = orig_ptr[0];
+            pod_ptr[1] = orig_ptr[1];
+            pod_ptr[2] = orig_ptr[2];
+            pod_ptr[3] = orig_ptr[3];
+            
+            pod_ptr[4] = 0x58000050; // LDR X16, #8
+            pod_ptr[5] = 0xD61F0200; // BR X16
+            *((uint64_t *)&pod_ptr[6]) = k_do_fault + 16;
+            
+            kunmap(pod_page);
+            kpm_tlbi_page((unsigned long)my_escape_pod);
+            asm volatile("ic ivau, %0\n dsb ish\n isb\n" : : "r" (my_escape_pod) : "memory");
+        }
+
         kernel_ptep = pte_offset_kernel((pmd_t *)k_init_mm, k_do_fault); 
         if (!kernel_ptep) goto out;
 
@@ -292,13 +307,6 @@ static int inject_and_setup_rx(struct rx_patch_req *req) {
         offset = k_do_fault & ~PAGE_MASK;
         patch_addr = (uint32_t *)((char *)kaddr_new_kernel + offset);
         
-        memcpy(g_trampoline_escape_pod, patch_addr, 16);
-        escape_tail = (uint32_t *)(g_trampoline_escape_pod + 16);
-        escape_tail[0] = 0x58000050; 
-        escape_tail[1] = 0xD61F0200; 
-        *((uint64_t *)&escape_tail[2]) = k_do_fault + 16;
-
-        /* Bypass PAC/BTI：从第4个字节开始跳，保留原函数的头部签名 */
         patch_addr[1] = 0x58000050; 
         patch_addr[2] = 0xD61F0200; 
         *((uint64_t *)&patch_addr[3]) = (uint64_t)my_fault_trampoline;
