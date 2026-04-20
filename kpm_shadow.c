@@ -16,13 +16,16 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("RX_Engine");
-MODULE_DESCRIPTION("KPM Standalone R^X Engine V7 - Multi-Track");
+MODULE_DESCRIPTION("KPM Standalone R^X Engine V9 (Perfect Clone)");
 
 static unsigned long long k_do_fault = 0;
 module_param(k_do_fault, ullong, 0444);
 
 static unsigned long long k_init_mm = 0;
 module_param(k_init_mm, ullong, 0444);
+
+static unsigned long long k_exit_mmap = 0;
+module_param(k_exit_mmap, ullong, 0444);
 
 #define NETLINK_WUWA 29 
 
@@ -35,23 +38,11 @@ module_param(k_init_mm, ullong, 0444);
 #ifndef EC_DATA_ABORT_L
 #define EC_DATA_ABORT_L     0x24  
 #endif
-#ifndef PTE_VALID
-#define PTE_VALID        (1ULL << 0)
-#endif
-#ifndef PTE_TYPE_PAGE
-#define PTE_TYPE_PAGE    (3ULL << 0)
-#endif
 #ifndef PTE_USER
 #define PTE_USER         (1ULL << 6)   
 #endif
 #ifndef PTE_RDONLY
 #define PTE_RDONLY       (1ULL << 7)   
-#endif
-#ifndef PTE_AF
-#define PTE_AF           (1ULL << 10)
-#endif
-#ifndef PTE_NG
-#define PTE_NG           (1ULL << 11)
 #endif
 #ifndef PTE_PXN
 #define PTE_PXN          (1ULL << 53)
@@ -66,12 +57,12 @@ struct rx_patch_req {
     uint32_t data;
 };
 
-/* --- 核心升级：多轨并发追踪阵列 --- */
 #define MAX_RX_PAGES 32
 struct rx_page {
     uint64_t vaddr;
     uint64_t orig_pfn;
     uint64_t shadow_pfn;
+    uint64_t orig_pte_val; /* 核心修复：保存最原始的页表，完美继承所有硬件属性！ */
     bool active;
 };
 static struct rx_page g_rx_pages[MAX_RX_PAGES];
@@ -82,16 +73,14 @@ static bool g_kernel_hooked = false;
 
 static DEFINE_PER_CPU(int, g_in_hook);
 
-/* 代码段逃逸舱 */
+/* 物理逃逸舱 */
 __attribute__((naked)) void my_escape_pod(void) {
-    asm volatile(
-        "nop\nnop\nnop\nnop\n"
-        "nop\nnop\nnop\nnop\n"
-        "nop\nnop\nnop\nnop\n"
-    );
+    asm volatile("nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\n");
+}
+__attribute__((naked)) void my_exit_mmap_escape_pod(void) {
+    asm volatile("nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\n");
 }
 
-/* 狙击级 TLB 刷新 */
 static inline void kpm_tlbi_page(unsigned long uaddr) {
     asm volatile(
         "dsb ishst\n"
@@ -102,16 +91,34 @@ static inline void kpm_tlbi_page(unsigned long uaddr) {
     );
 }
 
-static u64 make_pte(unsigned long pfn, u64 prot) {
-    return (pfn << PAGE_SHIFT) | prot | PTE_VALID | PTE_TYPE_PAGE | PTE_AF | (3ULL << 8) | PTE_NG;
+/* --- 核心修复：基于原版 PTE 的完美属性克隆 --- */
+static u64 build_shadow_pte(struct rx_page *p) {
+    u64 entry = p->orig_pte_val;
+    entry &= ~0x0000FFFFFFFFF000UL;
+    entry |= (p->shadow_pfn << PAGE_SHIFT) & 0x0000FFFFFFFFF000UL;
+    entry &= ~PTE_UXN;       /* 允许 EL0 执行 */
+    entry &= ~PTE_PXN;       /* 允许 EL1 执行 */
+    entry &= ~(3ULL << 6);   /* 清空 AP 位 -> EL0 不可读写 */
+    return entry;
 }
 
-/* 修复点：移除了会导致 Netlink 失败的上下文检查 */
+static u64 build_orig_pte(struct rx_page *p) {
+    u64 entry = p->orig_pte_val;
+    entry &= ~0x0000FFFFFFFFF000UL;
+    entry |= (p->orig_pfn << PAGE_SHIFT) & 0x0000FFFFFFFFF000UL;
+    entry |= PTE_UXN;        /* 剥夺 EL0 执行权限 */
+    entry |= PTE_USER | PTE_RDONLY; /* 授予 EL0 只读权限 */
+    return entry;
+}
+
+static u64 build_restore_pte(struct rx_page *p) {
+    return p->orig_pte_val; /* 100% 还原 */
+}
+
+/* --- 核心修复：正确的页表漫游机制 --- */
 static pte_t* get_user_pte_safe(struct mm_struct *mm, unsigned long vaddr) {
     pgd_t *pgd; p4d_t *p4d; pud_t *pud; pmd_t *pmd; pte_t *ptep;
-    
     if (!mm) return NULL;
-
     pgd = pgd_offset(mm, vaddr);
     if (pgd_none(*pgd) || pgd_bad(*pgd)) return NULL;
     p4d = p4d_offset(pgd, vaddr);
@@ -120,23 +127,35 @@ static pte_t* get_user_pte_safe(struct mm_struct *mm, unsigned long vaddr) {
     if (pud_none(*pud) || pud_bad(*pud)) return NULL;
     pmd = pmd_offset(pud, vaddr);
     if (pmd_none(*pmd)) return NULL;
-    
-    /* 拒绝 2MB 大页 */
     if ((pte_val(*(pte_t*)pmd) & 3) == 1) return NULL; 
-    
     ptep = pte_offset_map(pmd, vaddr);
     return ptep;
 }
 
+static pte_t* get_kernel_pte_safe(unsigned long vaddr) {
+    pgd_t *pgd; p4d_t *p4d; pud_t *pud; pmd_t *pmd; pte_t *ptep;
+    struct mm_struct *init_mm_ptr = (struct mm_struct *)k_init_mm;
+    if (!init_mm_ptr) return NULL;
+    pgd = pgd_offset(init_mm_ptr, vaddr);
+    if (pgd_none(*pgd) || pgd_bad(*pgd)) return NULL;
+    p4d = p4d_offset(pgd, vaddr);
+    if (p4d_none(*p4d) || p4d_bad(*p4d)) return NULL;
+    pud = pud_offset(p4d, vaddr);
+    if (pud_none(*pud) || pud_bad(*pud)) return NULL;
+    pmd = pmd_offset(pud, vaddr);
+    if (pmd_none(*pmd)) return NULL;
+    ptep = pte_offset_kernel(pmd, vaddr);
+    return ptep;
+}
+
+/* --- 缺页分发器 --- */
 int my_fault_dispatcher(unsigned long addr, unsigned int esr, struct pt_regs *regs) {
     unsigned int ec;
     pte_t *ptep;
-    u64 entry;
     unsigned long flags;
     struct rx_page *p = NULL;
     int i;
 
-    /* 多轨匹配：看触发异常的地址是否在我们的保护名单里 */
     for (i = 0; i < MAX_RX_PAGES; i++) {
         if (g_rx_pages[i].active && (addr & PAGE_MASK) == g_rx_pages[i].vaddr) {
             p = &g_rx_pages[i];
@@ -162,27 +181,18 @@ int my_fault_dispatcher(unsigned long addr, unsigned int esr, struct pt_regs *re
     ec = esr >> ESR_ELx_EC_SHIFT;
 
     if (ec == EC_INSN_ABORT_L) {
-        entry = make_pte(p->shadow_pfn, 0); 
-        *((volatile u64 *)ptep) = 0;
-        kpm_tlbi_page(p->vaddr);
-        *((volatile u64 *)ptep) = entry;
-        kpm_tlbi_page(p->vaddr);
-        
+        *((volatile u64 *)ptep) = 0; kpm_tlbi_page(p->vaddr);
+        *((volatile u64 *)ptep) = build_shadow_pte(p); kpm_tlbi_page(p->vaddr);
         __this_cpu_write(g_in_hook, 0);
         local_irq_restore(flags);
         return 1;
     } else if (ec == EC_DATA_ABORT_L) {
-        entry = make_pte(p->orig_pfn, PTE_USER | PTE_RDONLY | PTE_UXN);
-        *((volatile u64 *)ptep) = 0;
-        kpm_tlbi_page(p->vaddr);
-        *((volatile u64 *)ptep) = entry;
-        kpm_tlbi_page(p->vaddr);
-        
+        *((volatile u64 *)ptep) = 0; kpm_tlbi_page(p->vaddr);
+        *((volatile u64 *)ptep) = build_orig_pte(p); kpm_tlbi_page(p->vaddr);
         __this_cpu_write(g_in_hook, 0);
         local_irq_restore(flags);
         return 1;
     }
-    
     __this_cpu_write(g_in_hook, 0);
     local_irq_restore(flags);
     return 0;
@@ -190,82 +200,86 @@ int my_fault_dispatcher(unsigned long addr, unsigned int esr, struct pt_regs *re
 
 __attribute__((naked)) void my_fault_trampoline(void) {
     asm volatile(
-        "stp x0, x1, [sp, #-16]!\n"
-        "stp x2, x3, [sp, #-16]!\n"
-        "stp x4, x5, [sp, #-16]!\n"
-        "stp x6, x7, [sp, #-16]!\n"
-        "stp x8, x9, [sp, #-16]!\n"
-        "stp x10, x11, [sp, #-16]!\n"
-        "stp x12, x13, [sp, #-16]!\n"
-        "stp x14, x15, [sp, #-16]!\n"
-        "stp x16, x17, [sp, #-16]!\n"
-        "stp x18, x19, [sp, #-16]!\n"
+        "stp x0, x1, [sp, #-16]!\n" "stp x2, x3, [sp, #-16]!\n"
+        "stp x4, x5, [sp, #-16]!\n" "stp x6, x7, [sp, #-16]!\n"
+        "stp x8, x9, [sp, #-16]!\n" "stp x10, x11, [sp, #-16]!\n"
+        "stp x12, x13, [sp, #-16]!\n" "stp x14, x15, [sp, #-16]!\n"
+        "stp x16, x17, [sp, #-16]!\n" "stp x18, x19, [sp, #-16]!\n"
         "stp x29, x30, [sp, #-16]!\n"
-        
         "bl my_fault_dispatcher\n"
         "cmp x0, #1\n"
         "b.eq .L_handled\n"
-        
-        "ldp x29, x30, [sp], #16\n"
-        "ldp x18, x19, [sp], #16\n"
-        "ldp x16, x17, [sp], #16\n"
-        "ldp x14, x15, [sp], #16\n"
-        "ldp x12, x13, [sp], #16\n"
-        "ldp x10, x11, [sp], #16\n"
-        "ldp x8, x9, [sp], #16\n"
-        "ldp x6, x7, [sp], #16\n"
-        "ldp x4, x5, [sp], #16\n"
-        "ldp x2, x3, [sp], #16\n"
+        "ldp x29, x30, [sp], #16\n" "ldp x18, x19, [sp], #16\n"
+        "ldp x16, x17, [sp], #16\n" "ldp x14, x15, [sp], #16\n"
+        "ldp x12, x13, [sp], #16\n" "ldp x10, x11, [sp], #16\n"
+        "ldp x8, x9, [sp], #16\n" "ldp x6, x7, [sp], #16\n"
+        "ldp x4, x5, [sp], #16\n" "ldp x2, x3, [sp], #16\n"
         "ldp x0, x1, [sp], #16\n"
         "ldr x16, =my_escape_pod\n" 
         "br x16\n"
-        
         ".L_handled:\n"
-        "ldp x29, x30, [sp], #16\n"
-        "ldp x18, x19, [sp], #16\n"
-        "ldp x16, x17, [sp], #16\n"
-        "ldp x14, x15, [sp], #16\n"
-        "ldp x12, x13, [sp], #16\n"
-        "ldp x10, x11, [sp], #16\n"
-        "ldp x8, x9, [sp], #16\n"
-        "ldp x6, x7, [sp], #16\n"
-        "ldp x4, x5, [sp], #16\n"
-        "ldp x2, x3, [sp], #16\n"
+        "ldp x29, x30, [sp], #16\n" "ldp x18, x19, [sp], #16\n"
+        "ldp x16, x17, [sp], #16\n" "ldp x14, x15, [sp], #16\n"
+        "ldp x12, x13, [sp], #16\n" "ldp x10, x11, [sp], #16\n"
+        "ldp x8, x9, [sp], #16\n" "ldp x6, x7, [sp], #16\n"
+        "ldp x4, x5, [sp], #16\n" "ldp x2, x3, [sp], #16\n"
         "ldp x0, x1, [sp], #16\n"
         "ret\n"
     );
 }
 
+/* 进程死亡自动清理管家 */
+void my_exit_mmap_dispatcher(struct mm_struct *mm) {
+    int i; pte_t *ptep;
+    if (!mm || mm != g_game_mm) return;
+
+    for (i = 0; i < MAX_RX_PAGES; i++) {
+        if (g_rx_pages[i].active) {
+            ptep = get_user_pte_safe(mm, g_rx_pages[i].vaddr);
+            if (ptep) {
+                *((volatile u64 *)ptep) = 0; kpm_tlbi_page(g_rx_pages[i].vaddr);
+                *((volatile u64 *)ptep) = build_restore_pte(&g_rx_pages[i]); 
+                kpm_tlbi_page(g_rx_pages[i].vaddr);
+            }
+            __free_page(pfn_to_page(g_rx_pages[i].shadow_pfn));
+            g_rx_pages[i].active = false;
+        }
+    }
+    g_game_mm = NULL;
+    pr_info("[RX] Auto Teardown Done.\n");
+}
+
+__attribute__((naked)) void my_exit_mmap_trampoline(void) {
+    asm volatile(
+        "stp x0, x1, [sp, #-16]!\n" "stp x2, x3, [sp, #-16]!\n"
+        "stp x4, x5, [sp, #-16]!\n" "stp x6, x7, [sp, #-16]!\n"
+        "stp x8, x9, [sp, #-16]!\n" "stp x10, x11, [sp, #-16]!\n"
+        "stp x12, x13, [sp, #-16]!\n" "stp x14, x15, [sp, #-16]!\n"
+        "stp x16, x17, [sp, #-16]!\n" "stp x18, x19, [sp, #-16]!\n"
+        "stp x29, x30, [sp, #-16]!\n"
+        "bl my_exit_mmap_dispatcher\n"
+        "ldp x29, x30, [sp], #16\n" "ldp x18, x19, [sp], #16\n"
+        "ldp x16, x17, [sp], #16\n" "ldp x14, x15, [sp], #16\n"
+        "ldp x12, x13, [sp], #16\n" "ldp x10, x11, [sp], #16\n"
+        "ldp x8, x9, [sp], #16\n" "ldp x6, x7, [sp], #16\n"
+        "ldp x4, x5, [sp], #16\n" "ldp x2, x3, [sp], #16\n"
+        "ldp x0, x1, [sp], #16\n"
+        "ldr x16, =my_exit_mmap_escape_pod\n" 
+        "br x16\n"
+    );
+}
+
 static int inject_and_setup_rx(struct rx_patch_req *req) {
-    struct task_struct *task;
-    struct mm_struct *mm;
+    struct task_struct *task; struct mm_struct *mm;
     struct page *orig_page, *shadow_page, *new_kpage, *pod_page;
     void *kaddr_orig, *kaddr_shadow, *kaddr_new_kernel, *pod_kaddr;
     pte_t *game_ptep, *kernel_ptep, *pod_ptep;
     unsigned long flags, offset, pod_offset;
     uint32_t *patch_addr, *pod_ptr, *orig_ptr;
-    u64 entry, raw_kpte;
-    int i;
-    struct rx_page *p = NULL;
+    int i; struct rx_page *p = NULL;
 
-    /* 清理还原逻辑 (遍历所有槽位) */
     if (req->addr == 0) {
-        for (i = 0; i < MAX_RX_PAGES; i++) {
-            if (g_rx_pages[i].active && g_game_mm) {
-                game_ptep = get_user_pte_safe(g_game_mm, g_rx_pages[i].vaddr);
-                if (game_ptep) {
-                    /* 还原为普通代码段：用户可执行、只读 (r-xp) */
-                    entry = make_pte(g_rx_pages[i].orig_pfn, PTE_USER | PTE_RDONLY); 
-                    *((volatile u64 *)game_ptep) = 0; 
-                    kpm_tlbi_page(g_rx_pages[i].vaddr);
-                    *((volatile u64 *)game_ptep) = entry;
-                    kpm_tlbi_page(g_rx_pages[i].vaddr);
-                }
-                __free_page(pfn_to_page(g_rx_pages[i].shadow_pfn));
-                g_rx_pages[i].active = false;
-            }
-        }
-        pr_info("[RX] All KPM Modes Cleaned up.\n");
+        if (g_game_mm) my_exit_mmap_dispatcher(g_game_mm);
         return 0;
     }
 
@@ -282,43 +296,33 @@ static int inject_and_setup_rx(struct rx_patch_req *req) {
     
     g_game_mm = mm;
 
-    /* 核心 1：检查是否页面已经存在于保护名单 */
     for (i = 0; i < MAX_RX_PAGES; i++) {
         if (g_rx_pages[i].active && g_rx_pages[i].vaddr == (req->addr & PAGE_MASK)) {
-            p = &g_rx_pages[i];
-            break;
+            p = &g_rx_pages[i]; break;
         }
     }
 
     if (p) {
-        /* 如果页面已存在，只需要更新影子页里的代码即可，无需重绑 PTE */
         kaddr_shadow = kmap(pfn_to_page(p->shadow_pfn));
         *(uint32_t *)((char *)kaddr_shadow + (req->addr & ~PAGE_MASK)) = req->data;
+        asm volatile("ic ialluis\n dsb ish\n isb\n" ::: "memory"); /* 核心刷新：防止缓存错乱死机 */
         kunmap(pfn_to_page(p->shadow_pfn));
         kpm_tlbi_page(p->vaddr);
-        pr_info("[RX] Multi-Track: Updated existing page at %llx.\n", p->vaddr);
         mmput(mm); put_task_struct(task);
         return 0;
     }
 
-    /* 核心 2：如果是一个新页面，寻找一个空闲槽位 */
     for (i = 0; i < MAX_RX_PAGES; i++) {
-        if (!g_rx_pages[i].active) {
-            p = &g_rx_pages[i];
-            break;
-        }
+        if (!g_rx_pages[i].active) { p = &g_rx_pages[i]; break; }
     }
-    if (!p) {
-        pr_err("[RX] Error: MAX_RX_PAGES reached!\n");
-        mmput(mm); put_task_struct(task);
-        return -ENOMEM;
-    }
+    if (!p) { mmput(mm); put_task_struct(task); return -ENOMEM; }
 
     game_ptep = get_user_pte_safe(mm, req->addr & PAGE_MASK);
     if (!game_ptep) goto out;
 
-    /* 分配并克隆物理页 */
     p->vaddr = req->addr & PAGE_MASK;
+    p->orig_pte_val = pte_val(*game_ptep); /* 拍下快照，保留所有硬件属性 */
+
     orig_page = pte_page(*game_ptep);
     p->orig_pfn = page_to_pfn(orig_page);
 
@@ -329,67 +333,85 @@ static int inject_and_setup_rx(struct rx_patch_req *req) {
     kaddr_shadow = kmap(shadow_page);
     memcpy(kaddr_shadow, kaddr_orig, PAGE_SIZE);
     *(uint32_t *)((char *)kaddr_shadow + (req->addr & ~PAGE_MASK)) = req->data;
-    kunmap(shadow_page);
-    kunmap(orig_page);
+    asm volatile("ic ialluis\n dsb ish\n isb\n" ::: "memory"); /* 核心刷新 */
+    kunmap(shadow_page); kunmap(orig_page);
 
     p->active = true;
 
-    /* 埋下雷管：将 PTE 设为不可执行，强行迫使游戏执行时触发异常进入驱动 */
-    entry = make_pte(p->orig_pfn, PTE_USER | PTE_RDONLY | PTE_UXN);
-    *((volatile u64 *)game_ptep) = 0; 
-    kpm_tlbi_page(p->vaddr);
-    *((volatile u64 *)game_ptep) = entry;
-    kpm_tlbi_page(p->vaddr);
+    /* 挂载初始诱饵（原版页，去除执行权限） */
+    *((volatile u64 *)game_ptep) = 0; kpm_tlbi_page(p->vaddr);
+    *((volatile u64 *)game_ptep) = build_orig_pte(p); kpm_tlbi_page(p->vaddr);
 
-    /* 初始化内核全局钩子 (仅执行一次) */
     if (!g_kernel_hooked) {
-        pod_ptep = pte_offset_kernel((pmd_t *)k_init_mm, (unsigned long)my_escape_pod);
+        /* Hook 1: 缺页异常 */
+        pod_ptep = get_kernel_pte_safe((unsigned long)my_escape_pod);
         if (pod_ptep) {
-            pod_page = pte_page(*pod_ptep);
-            pod_kaddr = kmap(pod_page);
+            pod_page = pte_page(*pod_ptep); pod_kaddr = kmap(pod_page);
             pod_offset = (unsigned long)my_escape_pod & ~PAGE_MASK;
             pod_ptr = (uint32_t *)((char *)pod_kaddr + pod_offset);
             orig_ptr = (uint32_t *)(k_do_fault & ~3UL);
-            
-            pod_ptr[0] = 0xD503249F;  // BTI J
-            pod_ptr[1] = orig_ptr[1]; 
-            pod_ptr[2] = orig_ptr[2]; 
-            pod_ptr[3] = orig_ptr[3]; 
-            pod_ptr[4] = orig_ptr[4]; 
-            
-            pod_ptr[5] = 0x58000050; 
-            pod_ptr[6] = 0xD61F0200; 
+            pod_ptr[0] = 0xD503249F;  pod_ptr[1] = orig_ptr[1]; 
+            pod_ptr[2] = orig_ptr[2]; pod_ptr[3] = orig_ptr[3]; pod_ptr[4] = orig_ptr[4]; 
+            pod_ptr[5] = 0x58000050;  pod_ptr[6] = 0xD61F0200; 
             *((uint64_t *)&pod_ptr[7]) = k_do_fault + 20; 
-            
-            kunmap(pod_page);
-            kpm_tlbi_page((unsigned long)my_escape_pod);
+            kunmap(pod_page); kpm_tlbi_page((unsigned long)my_escape_pod);
             asm volatile("ic ivau, %0\n dsb ish\n isb\n" : : "r" (my_escape_pod) : "memory");
         }
+        kernel_ptep = get_kernel_pte_safe(k_do_fault); 
+        if (kernel_ptep) {
+            new_kpage = alloc_page(GFP_KERNEL | __GFP_ZERO);
+            kaddr_new_kernel = page_address(new_kpage);
+            memcpy(kaddr_new_kernel, (void *)(k_do_fault & PAGE_MASK), PAGE_SIZE);
+            offset = k_do_fault & ~PAGE_MASK;
+            patch_addr = (uint32_t *)((char *)kaddr_new_kernel + offset);
+            patch_addr[1] = 0x58000050; patch_addr[2] = 0xD61F0200; 
+            *((uint64_t *)&patch_addr[3]) = (uint64_t)my_fault_trampoline;
+            u64 raw_kpte = pte_val(*kernel_ptep);
+            raw_kpte &= ~0x0000FFFFFFFFF000UL;
+            raw_kpte |= (page_to_pfn(new_kpage) << PAGE_SHIFT);
+            raw_kpte &= ~(1ULL << 52); 
+            local_irq_save(flags); 
+            *((volatile u64 *)kernel_ptep) = raw_kpte;
+            asm volatile("dsb ishst\ntlbi vmalle1is\ndsb ish\nisb\nic ialluis\ndsb ish\nisb\n" ::: "memory");
+            local_irq_restore(flags); 
+        }
 
-        kernel_ptep = pte_offset_kernel((pmd_t *)k_init_mm, k_do_fault); 
-        if (!kernel_ptep) goto out;
-
-        new_kpage = alloc_page(GFP_KERNEL | __GFP_ZERO);
-        kaddr_new_kernel = page_address(new_kpage);
-        memcpy(kaddr_new_kernel, (void *)(k_do_fault & PAGE_MASK), PAGE_SIZE);
-
-        offset = k_do_fault & ~PAGE_MASK;
-        patch_addr = (uint32_t *)((char *)kaddr_new_kernel + offset);
-        
-        patch_addr[1] = 0x58000050; 
-        patch_addr[2] = 0xD61F0200; 
-        *((uint64_t *)&patch_addr[3]) = (uint64_t)my_fault_trampoline;
-
-        raw_kpte = (page_to_pfn(new_kpage) << PAGE_SHIFT) | (pte_val(*kernel_ptep) & 0x0000FFFFFFFFF000UL) | PTE_VALID | PTE_AF | PTE_NG;
-        raw_kpte &= ~(1ULL << 52); 
-
-        local_irq_save(flags); 
-        *((volatile u64 *)kernel_ptep) = raw_kpte;
-        asm volatile("dsb ishst\ntlbi vmalle1is\ndsb ish\nisb\nic ialluis\ndsb ish\nisb\n" ::: "memory");
-        local_irq_restore(flags); 
-        
+        /* Hook 2: 进程死亡回调 */
+        if (k_exit_mmap) {
+            pod_ptep = get_kernel_pte_safe((unsigned long)my_exit_mmap_escape_pod);
+            if (pod_ptep) {
+                pod_page = pte_page(*pod_ptep); pod_kaddr = kmap(pod_page);
+                pod_offset = (unsigned long)my_exit_mmap_escape_pod & ~PAGE_MASK;
+                pod_ptr = (uint32_t *)((char *)pod_kaddr + pod_offset);
+                orig_ptr = (uint32_t *)(k_exit_mmap & ~3UL);
+                pod_ptr[0] = 0xD503249F;  pod_ptr[1] = orig_ptr[1]; 
+                pod_ptr[2] = orig_ptr[2]; pod_ptr[3] = orig_ptr[3]; pod_ptr[4] = orig_ptr[4]; 
+                pod_ptr[5] = 0x58000050;  pod_ptr[6] = 0xD61F0200; 
+                *((uint64_t *)&pod_ptr[7]) = k_exit_mmap + 20; 
+                kunmap(pod_page); kpm_tlbi_page((unsigned long)my_exit_mmap_escape_pod);
+                asm volatile("ic ivau, %0\n dsb ish\n isb\n" : : "r" (my_exit_mmap_escape_pod) : "memory");
+            }
+            kernel_ptep = get_kernel_pte_safe(k_exit_mmap); 
+            if (kernel_ptep) {
+                new_kpage = alloc_page(GFP_KERNEL | __GFP_ZERO);
+                kaddr_new_kernel = page_address(new_kpage);
+                memcpy(kaddr_new_kernel, (void *)(k_exit_mmap & PAGE_MASK), PAGE_SIZE);
+                offset = k_exit_mmap & ~PAGE_MASK;
+                patch_addr = (uint32_t *)((char *)kaddr_new_kernel + offset);
+                patch_addr[1] = 0x58000050; patch_addr[2] = 0xD61F0200; 
+                *((uint64_t *)&patch_addr[3]) = (uint64_t)my_exit_mmap_trampoline;
+                u64 raw_kpte = pte_val(*kernel_ptep);
+                raw_kpte &= ~0x0000FFFFFFFFF000UL;
+                raw_kpte |= (page_to_pfn(new_kpage) << PAGE_SHIFT);
+                raw_kpte &= ~(1ULL << 52); 
+                local_irq_save(flags); 
+                *((volatile u64 *)kernel_ptep) = raw_kpte;
+                asm volatile("dsb ishst\ntlbi vmalle1is\ndsb ish\nisb\nic ialluis\ndsb ish\nisb\n" ::: "memory");
+                local_irq_restore(flags); 
+            }
+        }
         g_kernel_hooked = true;
-        pr_info("[RX] KPM Standalone Engine V7 Online.\n");
+        pr_info("[RX] KPM V9 (Perfect Clone) Online.\n");
     }
 
 out:
