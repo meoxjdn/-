@@ -5,6 +5,7 @@
 #include <linux/mm.h>
 #include <linux/uaccess.h>
 #include <linux/highmem.h>
+#include <linux/vmalloc.h>
 #include <asm/pgtable.h>
 #include <asm/tlbflush.h>
 #include <linux/pgtable.h>
@@ -16,13 +17,10 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("RX_Engine");
-MODULE_DESCRIPTION("KPM Standalone R^X Engine V9 (Perfect Clone)");
+MODULE_DESCRIPTION("KPM Standalone R^X Engine V10 (Safe Vmap Patching)");
 
 static unsigned long long k_do_fault = 0;
 module_param(k_do_fault, ullong, 0444);
-
-static unsigned long long k_init_mm = 0;
-module_param(k_init_mm, ullong, 0444);
 
 static unsigned long long k_exit_mmap = 0;
 module_param(k_exit_mmap, ullong, 0444);
@@ -62,7 +60,7 @@ struct rx_page {
     uint64_t vaddr;
     uint64_t orig_pfn;
     uint64_t shadow_pfn;
-    uint64_t orig_pte_val; /* 核心修复：保存最原始的页表，完美继承所有硬件属性！ */
+    uint64_t orig_pte_val; 
     bool active;
 };
 static struct rx_page g_rx_pages[MAX_RX_PAGES];
@@ -73,12 +71,12 @@ static bool g_kernel_hooked = false;
 
 static DEFINE_PER_CPU(int, g_in_hook);
 
-/* 物理逃逸舱 */
+/* 物理逃逸舱（预留足够空间供安全替换） */
 __attribute__((naked)) void my_escape_pod(void) {
-    asm volatile("nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\n");
+    asm volatile("nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\n");
 }
 __attribute__((naked)) void my_exit_mmap_escape_pod(void) {
-    asm volatile("nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\n");
+    asm volatile("nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\n");
 }
 
 static inline void kpm_tlbi_page(unsigned long uaddr) {
@@ -91,14 +89,46 @@ static inline void kpm_tlbi_page(unsigned long uaddr) {
     );
 }
 
-/* --- 核心修复：基于原版 PTE 的完美属性克隆 --- */
+/* --- 核心 1：安全的 Vmap 内存指令强制改写（绝不破坏内核 2MB 块映射） --- */
+static int safe_vmap_patch(unsigned long target_vaddr, uint32_t *insns, int count) {
+    u64 par;
+    struct page *kpage;
+    void *rw_addr;
+    uint32_t *ptr;
+    
+    /* 使用底层 CPU 指令获取物理地址，100% 精准无误 */
+    asm volatile("at s1e1r, %0" : : "r"(target_vaddr));
+    asm volatile("isb");
+    asm volatile("mrs %0, par_el1" : "=r"(par));
+    if (par & 1) {
+        pr_err("[RX] AT translation failed for %lx\n", target_vaddr);
+        return -1;
+    }
+    
+    kpage = pfn_to_page((par & 0x0000FFFFFFFFF000UL) >> PAGE_SHIFT);
+    rw_addr = vmap(&kpage, 1, VM_MAP, PAGE_KERNEL);
+    if (!rw_addr) {
+        pr_err("[RX] vmap failed for %lx\n", target_vaddr);
+        return -1;
+    }
+    
+    ptr = (uint32_t *)((char *)rw_addr + (target_vaddr & ~PAGE_MASK));
+    memcpy(ptr, insns, count * sizeof(uint32_t));
+    
+    vunmap(rw_addr);
+    /* 全局刷新指令缓存，确保新指令生效 */
+    asm volatile("ic ialluis\n dsb ish\n isb\n" ::: "memory");
+    return 0;
+}
+
+/* --- 核心 2：完美克隆属性，保持设备内存特征不被破坏 --- */
 static u64 build_shadow_pte(struct rx_page *p) {
     u64 entry = p->orig_pte_val;
     entry &= ~0x0000FFFFFFFFF000UL;
     entry |= (p->shadow_pfn << PAGE_SHIFT) & 0x0000FFFFFFFFF000UL;
-    entry &= ~PTE_UXN;       /* 允许 EL0 执行 */
-    entry &= ~PTE_PXN;       /* 允许 EL1 执行 */
-    entry &= ~(3ULL << 6);   /* 清空 AP 位 -> EL0 不可读写 */
+    entry |= PTE_USER | PTE_RDONLY;
+    entry &= ~PTE_UXN; 
+    entry &= ~PTE_PXN; 
     return entry;
 }
 
@@ -106,16 +136,16 @@ static u64 build_orig_pte(struct rx_page *p) {
     u64 entry = p->orig_pte_val;
     entry &= ~0x0000FFFFFFFFF000UL;
     entry |= (p->orig_pfn << PAGE_SHIFT) & 0x0000FFFFFFFFF000UL;
-    entry |= PTE_UXN;        /* 剥夺 EL0 执行权限 */
-    entry |= PTE_USER | PTE_RDONLY; /* 授予 EL0 只读权限 */
+    entry |= PTE_USER | PTE_RDONLY;
+    entry |= PTE_UXN; 
+    entry |= PTE_PXN; 
     return entry;
 }
 
 static u64 build_restore_pte(struct rx_page *p) {
-    return p->orig_pte_val; /* 100% 还原 */
+    return p->orig_pte_val;
 }
 
-/* --- 核心修复：正确的页表漫游机制 --- */
 static pte_t* get_user_pte_safe(struct mm_struct *mm, unsigned long vaddr) {
     pgd_t *pgd; p4d_t *p4d; pud_t *pud; pmd_t *pmd; pte_t *ptep;
     if (!mm) return NULL;
@@ -129,22 +159,6 @@ static pte_t* get_user_pte_safe(struct mm_struct *mm, unsigned long vaddr) {
     if (pmd_none(*pmd)) return NULL;
     if ((pte_val(*(pte_t*)pmd) & 3) == 1) return NULL; 
     ptep = pte_offset_map(pmd, vaddr);
-    return ptep;
-}
-
-static pte_t* get_kernel_pte_safe(unsigned long vaddr) {
-    pgd_t *pgd; p4d_t *p4d; pud_t *pud; pmd_t *pmd; pte_t *ptep;
-    struct mm_struct *init_mm_ptr = (struct mm_struct *)k_init_mm;
-    if (!init_mm_ptr) return NULL;
-    pgd = pgd_offset(init_mm_ptr, vaddr);
-    if (pgd_none(*pgd) || pgd_bad(*pgd)) return NULL;
-    p4d = p4d_offset(pgd, vaddr);
-    if (p4d_none(*p4d) || p4d_bad(*p4d)) return NULL;
-    pud = pud_offset(p4d, vaddr);
-    if (pud_none(*pud) || pud_bad(*pud)) return NULL;
-    pmd = pmd_offset(pud, vaddr);
-    if (pmd_none(*pmd)) return NULL;
-    ptep = pte_offset_kernel(pmd, vaddr);
     return ptep;
 }
 
@@ -271,11 +285,12 @@ __attribute__((naked)) void my_exit_mmap_trampoline(void) {
 
 static int inject_and_setup_rx(struct rx_patch_req *req) {
     struct task_struct *task; struct mm_struct *mm;
-    struct page *orig_page, *shadow_page, *new_kpage, *pod_page;
-    void *kaddr_orig, *kaddr_shadow, *kaddr_new_kernel, *pod_kaddr;
-    pte_t *game_ptep, *kernel_ptep, *pod_ptep;
-    unsigned long flags, offset, pod_offset;
-    uint32_t *patch_addr, *pod_ptr, *orig_ptr;
+    struct page *orig_page, *shadow_page;
+    void *kaddr_orig, *kaddr_shadow;
+    pte_t *game_ptep;
+    uint32_t pod_insns[9];
+    uint32_t hook_insns[4];
+    uint32_t *orig_ptr;
     int i; struct rx_page *p = NULL;
 
     if (req->addr == 0) {
@@ -283,7 +298,7 @@ static int inject_and_setup_rx(struct rx_patch_req *req) {
         return 0;
     }
 
-    if (!k_do_fault || !k_init_mm) return -EINVAL;
+    if (!k_do_fault) return -EINVAL;
 
     rcu_read_lock();
     task = pid_task(find_vpid(req->pid), PIDTYPE_PID);
@@ -305,7 +320,7 @@ static int inject_and_setup_rx(struct rx_patch_req *req) {
     if (p) {
         kaddr_shadow = kmap(pfn_to_page(p->shadow_pfn));
         *(uint32_t *)((char *)kaddr_shadow + (req->addr & ~PAGE_MASK)) = req->data;
-        asm volatile("ic ialluis\n dsb ish\n isb\n" ::: "memory"); /* 核心刷新：防止缓存错乱死机 */
+        asm volatile("ic ialluis\n dsb ish\n isb\n" ::: "memory"); 
         kunmap(pfn_to_page(p->shadow_pfn));
         kpm_tlbi_page(p->vaddr);
         mmput(mm); put_task_struct(task);
@@ -321,7 +336,7 @@ static int inject_and_setup_rx(struct rx_patch_req *req) {
     if (!game_ptep) goto out;
 
     p->vaddr = req->addr & PAGE_MASK;
-    p->orig_pte_val = pte_val(*game_ptep); /* 拍下快照，保留所有硬件属性 */
+    p->orig_pte_val = pte_val(*game_ptep); 
 
     orig_page = pte_page(*game_ptep);
     p->orig_pfn = page_to_pfn(orig_page);
@@ -333,85 +348,47 @@ static int inject_and_setup_rx(struct rx_patch_req *req) {
     kaddr_shadow = kmap(shadow_page);
     memcpy(kaddr_shadow, kaddr_orig, PAGE_SIZE);
     *(uint32_t *)((char *)kaddr_shadow + (req->addr & ~PAGE_MASK)) = req->data;
-    asm volatile("ic ialluis\n dsb ish\n isb\n" ::: "memory"); /* 核心刷新 */
+    asm volatile("ic ialluis\n dsb ish\n isb\n" ::: "memory"); 
     kunmap(shadow_page); kunmap(orig_page);
 
     p->active = true;
 
-    /* 挂载初始诱饵（原版页，去除执行权限） */
     *((volatile u64 *)game_ptep) = 0; kpm_tlbi_page(p->vaddr);
     *((volatile u64 *)game_ptep) = build_orig_pte(p); kpm_tlbi_page(p->vaddr);
 
     if (!g_kernel_hooked) {
-        /* Hook 1: 缺页异常 */
-        pod_ptep = get_kernel_pte_safe((unsigned long)my_escape_pod);
-        if (pod_ptep) {
-            pod_page = pte_page(*pod_ptep); pod_kaddr = kmap(pod_page);
-            pod_offset = (unsigned long)my_escape_pod & ~PAGE_MASK;
-            pod_ptr = (uint32_t *)((char *)pod_kaddr + pod_offset);
-            orig_ptr = (uint32_t *)(k_do_fault & ~3UL);
-            pod_ptr[0] = 0xD503249F;  pod_ptr[1] = orig_ptr[1]; 
-            pod_ptr[2] = orig_ptr[2]; pod_ptr[3] = orig_ptr[3]; pod_ptr[4] = orig_ptr[4]; 
-            pod_ptr[5] = 0x58000050;  pod_ptr[6] = 0xD61F0200; 
-            *((uint64_t *)&pod_ptr[7]) = k_do_fault + 20; 
-            kunmap(pod_page); kpm_tlbi_page((unsigned long)my_escape_pod);
-            asm volatile("ic ivau, %0\n dsb ish\n isb\n" : : "r" (my_escape_pod) : "memory");
-        }
-        kernel_ptep = get_kernel_pte_safe(k_do_fault); 
-        if (kernel_ptep) {
-            new_kpage = alloc_page(GFP_KERNEL | __GFP_ZERO);
-            kaddr_new_kernel = page_address(new_kpage);
-            memcpy(kaddr_new_kernel, (void *)(k_do_fault & PAGE_MASK), PAGE_SIZE);
-            offset = k_do_fault & ~PAGE_MASK;
-            patch_addr = (uint32_t *)((char *)kaddr_new_kernel + offset);
-            patch_addr[1] = 0x58000050; patch_addr[2] = 0xD61F0200; 
-            *((uint64_t *)&patch_addr[3]) = (uint64_t)my_fault_trampoline;
-            u64 raw_kpte = pte_val(*kernel_ptep);
-            raw_kpte &= ~0x0000FFFFFFFFF000UL;
-            raw_kpte |= (page_to_pfn(new_kpage) << PAGE_SHIFT);
-            raw_kpte &= ~(1ULL << 52); 
-            local_irq_save(flags); 
-            *((volatile u64 *)kernel_ptep) = raw_kpte;
-            asm volatile("dsb ishst\ntlbi vmalle1is\ndsb ish\nisb\nic ialluis\ndsb ish\nisb\n" ::: "memory");
-            local_irq_restore(flags); 
-        }
+        /* Hook 1: 安全 vmap 挂载缺页异常 */
+        orig_ptr = (uint32_t *)(k_do_fault & ~3UL);
+        pod_insns[0] = 0xD503249F;  // BTI J
+        pod_insns[1] = orig_ptr[1]; pod_insns[2] = orig_ptr[2]; 
+        pod_insns[3] = orig_ptr[3]; pod_insns[4] = orig_ptr[4]; 
+        pod_insns[5] = 0x58000050;  // LDR X16, #8
+        pod_insns[6] = 0xD61F0200;  // BR X16
+        *((uint64_t *)&pod_insns[7]) = k_do_fault + 20; 
+        safe_vmap_patch((unsigned long)my_escape_pod, pod_insns, 9);
+        
+        hook_insns[0] = 0x58000050; // LDR X16, #8
+        hook_insns[1] = 0xD61F0200; // BR X16
+        *((uint64_t *)&hook_insns[2]) = (uint64_t)my_fault_trampoline;
+        safe_vmap_patch(k_do_fault + 4, hook_insns, 4);
 
-        /* Hook 2: 进程死亡回调 */
+        /* Hook 2: 安全 vmap 挂载进程死亡回调 */
         if (k_exit_mmap) {
-            pod_ptep = get_kernel_pte_safe((unsigned long)my_exit_mmap_escape_pod);
-            if (pod_ptep) {
-                pod_page = pte_page(*pod_ptep); pod_kaddr = kmap(pod_page);
-                pod_offset = (unsigned long)my_exit_mmap_escape_pod & ~PAGE_MASK;
-                pod_ptr = (uint32_t *)((char *)pod_kaddr + pod_offset);
-                orig_ptr = (uint32_t *)(k_exit_mmap & ~3UL);
-                pod_ptr[0] = 0xD503249F;  pod_ptr[1] = orig_ptr[1]; 
-                pod_ptr[2] = orig_ptr[2]; pod_ptr[3] = orig_ptr[3]; pod_ptr[4] = orig_ptr[4]; 
-                pod_ptr[5] = 0x58000050;  pod_ptr[6] = 0xD61F0200; 
-                *((uint64_t *)&pod_ptr[7]) = k_exit_mmap + 20; 
-                kunmap(pod_page); kpm_tlbi_page((unsigned long)my_exit_mmap_escape_pod);
-                asm volatile("ic ivau, %0\n dsb ish\n isb\n" : : "r" (my_exit_mmap_escape_pod) : "memory");
-            }
-            kernel_ptep = get_kernel_pte_safe(k_exit_mmap); 
-            if (kernel_ptep) {
-                new_kpage = alloc_page(GFP_KERNEL | __GFP_ZERO);
-                kaddr_new_kernel = page_address(new_kpage);
-                memcpy(kaddr_new_kernel, (void *)(k_exit_mmap & PAGE_MASK), PAGE_SIZE);
-                offset = k_exit_mmap & ~PAGE_MASK;
-                patch_addr = (uint32_t *)((char *)kaddr_new_kernel + offset);
-                patch_addr[1] = 0x58000050; patch_addr[2] = 0xD61F0200; 
-                *((uint64_t *)&patch_addr[3]) = (uint64_t)my_exit_mmap_trampoline;
-                u64 raw_kpte = pte_val(*kernel_ptep);
-                raw_kpte &= ~0x0000FFFFFFFFF000UL;
-                raw_kpte |= (page_to_pfn(new_kpage) << PAGE_SHIFT);
-                raw_kpte &= ~(1ULL << 52); 
-                local_irq_save(flags); 
-                *((volatile u64 *)kernel_ptep) = raw_kpte;
-                asm volatile("dsb ishst\ntlbi vmalle1is\ndsb ish\nisb\nic ialluis\ndsb ish\nisb\n" ::: "memory");
-                local_irq_restore(flags); 
-            }
+            orig_ptr = (uint32_t *)(k_exit_mmap & ~3UL);
+            pod_insns[0] = 0xD503249F; 
+            pod_insns[1] = orig_ptr[1]; pod_insns[2] = orig_ptr[2]; 
+            pod_insns[3] = orig_ptr[3]; pod_insns[4] = orig_ptr[4]; 
+            pod_insns[5] = 0x58000050; pod_insns[6] = 0xD61F0200; 
+            *((uint64_t *)&pod_insns[7]) = k_exit_mmap + 20; 
+            safe_vmap_patch((unsigned long)my_exit_mmap_escape_pod, pod_insns, 9);
+            
+            hook_insns[0] = 0x58000050; 
+            hook_insns[1] = 0xD61F0200; 
+            *((uint64_t *)&hook_insns[2]) = (uint64_t)my_exit_mmap_trampoline;
+            safe_vmap_patch(k_exit_mmap + 4, hook_insns, 4);
         }
         g_kernel_hooked = true;
-        pr_info("[RX] KPM V9 (Perfect Clone) Online.\n");
+        pr_info("[RX] KPM V10 (Safe Vmap Patch) Online.\n");
     }
 
 out:
@@ -420,8 +397,7 @@ out:
 }
 
 static void nl_recv_msg(struct sk_buff *skb) {
-    struct nlmsghdr *nlh;
-    struct rx_patch_req *req;
+    struct nlmsghdr *nlh; struct rx_patch_req *req;
     if (skb->len >= nlmsg_total_size(0)) {
         nlh = nlmsg_hdr(skb);
         if (nlmsg_len(nlh) >= sizeof(struct rx_patch_req)) {
