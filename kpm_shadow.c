@@ -1,25 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * KPM Standalone R^X Engine V13
- *
- * 相对 V12 的修复：
- *   [FIX-T] g_game_mm 改为真正的弱引用语义：
- *           存储时不持有 mm_users 引用（注入完成后立刻 mmput）。
- *           读取时通过 mmget_not_zero() 原子升级为强引用，
- *           操作完成后立刻 mmput，绝不长期持有。
- *           彻底消除 mm_users 泄漏导致的僵尸进程问题。
- *
- *   [FIX-U] my_exit_mmap_dispatcher 的 Phase 2 不再写回 PTE：
- *           exit_mmap 调用时页表正在被内核销毁，写回无意义且危险。
- *           Phase 2 仅释放 shadow page 物理内存，PTE 恢复由内核接管。
- *
- *   [FIX-V] inject_and_setup_rx 进程切换清理逻辑重构：
- *           不在持锁/出锁边界反复横跳调用 dispatcher，
- *           改为取出旧 mm 指针后在锁外单次调用，消除重入风险。
- *
- *   [FIX-W] my_fault_dispatcher 读取 g_game_mm 时通过
- *           mmget_not_zero() 升级强引用，用完立刻释放，
- *           消除并发 exit_mmap 导致的 mm_struct UAF。
  */
 
 #include <linux/module.h>
@@ -43,7 +24,7 @@
 #include <linux/slab.h>
 #include <linux/bug.h>
 #include <linux/rcupdate.h>
-#include <linux/sched/mm.h>   /* mmget_not_zero, mmput */
+#include <linux/sched/mm.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("RX_Engine");
@@ -122,25 +103,20 @@ struct hook_site {
     bool          installed;
 };
 
+/*
+ * exit_mmap_dispatcher 内部使用的临时收集结构。
+ * V13 FIX-U：不再写回 PTE，只需 shadow_pfn 用于释放物理内存。
+ */
+struct rx_cleanup_entry {
+    uint64_t shadow_pfn;
+};
+
 /* -----------------------------------------------------------------------
  * 全局状态
- *
- * [FIX-T] g_game_mm 是弱引用指针：
- *   - 写入：inject_and_setup_rx 在 mmput 之前写入，mmput 之后指针仍有效
- *           但我们不依赖它的 mm_users > 0，只用它做身份标识。
- *   - 读取：必须通过 mmget_not_zero() 尝试升级，失败说明进程已在消亡，
- *           直接跳过操作。
- *   - 清空：由 my_exit_mmap_dispatcher（exit_mmap hook）负责，
- *           此时 mm_users 正在归零，是清空的最后时机。
  * ----------------------------------------------------------------------- */
 static struct rx_page    g_rx_pages[MAX_RX_PAGES];
 static DEFINE_SPINLOCK(g_rx_lock);
 static struct sock      *nl_sk           = NULL;
-
-/*
- * 弱引用：不持有 mm_users，仅作为"上次注入的目标"标识。
- * 所有读取路径必须通过 mmget_not_zero() 升级后才能解引用。
- */
 static struct mm_struct *g_game_mm       = NULL;
 static bool              g_kernel_hooked = false;
 static struct hook_site  g_hook_fault;
@@ -199,7 +175,7 @@ static inline void kpm_tlbi_page(unsigned long uaddr)
 }
 
 /* -----------------------------------------------------------------------
- * safe_vmap_patch（FIX-F：at s1e0r）
+ * safe_vmap_patch
  * ----------------------------------------------------------------------- */
 static int safe_vmap_patch(unsigned long target_vaddr,
                            uint32_t *insns, int count)
@@ -231,7 +207,7 @@ static int safe_vmap_patch(unsigned long target_vaddr,
 }
 
 /* -----------------------------------------------------------------------
- * PTE 构造（FIX-C）
+ * PTE 构造
  * ----------------------------------------------------------------------- */
 #define PTE_PFN_MASK     0x0000FFFFFFFFF000UL
 #define PTE_INHERIT_BITS (PTE_AF | PTE_NG)
@@ -259,13 +235,8 @@ static u64 build_orig_pte(struct rx_page *p)
     return entry;
 }
 
-static u64 build_restore_pte(struct rx_page *p)
-{
-    return p->orig_pte_val;
-}
-
 /* -----------------------------------------------------------------------
- * 页表遍历（FIX-A）
+ * 页表遍历
  * ----------------------------------------------------------------------- */
 static pte_t *get_user_pte_and_pmd(struct mm_struct *mm,
                                    unsigned long vaddr,
@@ -289,7 +260,7 @@ static pte_t *get_user_pte_and_pmd(struct mm_struct *mm,
 }
 
 /* -----------------------------------------------------------------------
- * PTE 写入（FIX-A/D/O：在 g_rx_lock 之外调用）
+ * PTE 写入（在 g_rx_lock 之外调用）
  * ----------------------------------------------------------------------- */
 static void pte_write_locked(struct mm_struct *mm,
                              unsigned long vaddr,
@@ -306,18 +277,6 @@ static void pte_write_locked(struct mm_struct *mm,
 
 /* -----------------------------------------------------------------------
  * 缺页分发器
- *
- * [FIX-W] 通过 mmget_not_zero() 安全升级 g_game_mm 弱引用：
- *   1. 持 g_rx_lock 读取 g_game_mm 指针
- *   2. 立刻调用 mmget_not_zero() 尝试原子递增 mm_users
- *   3. 成功：得到强引用，出锁后可安全操作
- *   4. 失败：进程正在消亡，mm_struct 即将释放，直接返回
- *   5. 操作完成后立刻 mmput() 归还引用
- *
- * 为什么要持锁再 mmget_not_zero：
- *   - 必须在持锁状态下读取指针并立刻升级，防止读指针和升级之间
- *     另一个核心将 g_game_mm 置 NULL 并释放 mm_struct。
- *   - mmget_not_zero 是原子操作，持锁状态下调用完全安全。
  * ----------------------------------------------------------------------- */
 int my_fault_dispatcher(unsigned long addr, unsigned int esr,
                         struct pt_regs *regs)
@@ -337,16 +296,11 @@ int my_fault_dispatcher(unsigned long addr, unsigned int esr,
         return 0;
     }
 
-    /* [FIX-W] 原子升级弱引用为强引用 */
     if (!mmget_not_zero(g_game_mm)) {
-        /*
-         * mm_users 已经是 0，进程正在消亡。
-         * exit_mmap hook 会（或已经）清理，我们什么都不用做。
-         */
         spin_unlock_irqrestore(&g_rx_lock, flags);
         return 0;
     }
-    mm = g_game_mm; /* 现在持有强引用，mm_struct 不会消失 */
+    mm = g_game_mm;
 
     for (i = 0; i < MAX_RX_PAGES; i++) {
         if (g_rx_pages[i].active &&
@@ -358,7 +312,7 @@ int my_fault_dispatcher(unsigned long addr, unsigned int esr,
 
     if (!p) {
         spin_unlock_irqrestore(&g_rx_lock, flags);
-        mmput(mm); /* [FIX-W] 归还强引用 */
+        mmput(mm);
         return 0;
     }
 
@@ -369,12 +323,6 @@ int my_fault_dispatcher(unsigned long addr, unsigned int esr,
     }
     __this_cpu_write(g_in_hook, 1);
 
-    /*
-     * 出锁后操作：此时持有 mm 强引用，mm_struct 安全。
-     * 注意：ptep 在出锁后可能因进程退出而无效，
-     * 但我们已经持有强引用，exit_mmap 必须等我们 mmput 后才能完成，
-     * 所以页表在这段时间内是稳定的。
-     */
     spin_unlock_irqrestore(&g_rx_lock, flags);
 
     ptep = get_user_pte_and_pmd(mm, p->vaddr, &pmd);
@@ -389,7 +337,7 @@ int my_fault_dispatcher(unsigned long addr, unsigned int esr,
     if (ec == EC_INSN_ABORT_L) {
         pte_write_locked(mm, p->vaddr, pmd, ptep, build_shadow_pte(p));
         __this_cpu_write(g_in_hook, 0);
-        mmput(mm); /* [FIX-W] 归还 */
+        mmput(mm);
         return 1;
     } else if (ec == EC_DATA_ABORT_L) {
         pte_write_locked(mm, p->vaddr, pmd, ptep, build_orig_pte(p));
@@ -404,7 +352,7 @@ int my_fault_dispatcher(unsigned long addr, unsigned int esr,
 }
 
 /* -----------------------------------------------------------------------
- * 缺页 trampoline（FIX-G/S）
+ * 缺页 trampoline
  * ----------------------------------------------------------------------- */
 __attribute__((naked)) void my_fault_trampoline(void)
 {
@@ -469,21 +417,7 @@ __attribute__((naked)) void my_fault_trampoline(void)
 
 /* -----------------------------------------------------------------------
  * 进程退出清理
- *
- * [FIX-T] 不调用 mmput：此函数由 exit_mmap hook 触发，
- *         调用时 mm_users 正在归零，我们没有持有引用，不需要释放。
- *
- * [FIX-U] Phase 2 不写回 PTE：
- *         exit_mmap 调用时页表正在被内核销毁，写回 PTE 无意义且危险。
- *         Phase 2 仅做 shadow page 物理内存释放。
- *         PTE 恢复由内核的 unmap_vmas() 流程接管。
- *
- * [FIX-V] 由 exit_mmap hook 直接传入 mm，不存在指针有效性问题。
  * ----------------------------------------------------------------------- */
-struct rx_cleanup_entry {
-    uint64_t shadow_pfn;
-};
-
 void my_exit_mmap_dispatcher(struct mm_struct *mm)
 {
     struct rx_cleanup_entry entries[MAX_RX_PAGES];
@@ -492,7 +426,6 @@ void my_exit_mmap_dispatcher(struct mm_struct *mm)
 
     if (!mm) return;
 
-    /* Phase 1：持锁收集 shadow_pfn，清空元数据 */
     spin_lock_irqsave(&g_rx_lock, flags);
 
     if (mm != g_game_mm) {
@@ -508,23 +441,10 @@ void my_exit_mmap_dispatcher(struct mm_struct *mm)
         }
     }
 
-    /*
-     * [FIX-T] 绝不调用 mmput：
-     *   我们从未持有这个 mm 的 mm_users 引用（注入时立刻 mmput），
-     *   所以这里只需要清空弱引用指针即可。
-     */
     g_game_mm = NULL;
 
     spin_unlock_irqrestore(&g_rx_lock, flags);
 
-    /*
-     * Phase 2：出锁释放 shadow page 物理内存。
-     *
-     * [FIX-U] 不写回 PTE：
-     *   exit_mmap 由内核调用时，unmap_vmas() 已经或即将清除所有用户 PTE，
-     *   我们写回的值会被立刻覆盖，且写入过程中 pmd 指针可能已经无效。
-     *   只需释放 shadow page 物理内存，防止内存泄漏。
-     */
     for (i = 0; i < count; i++)
         __free_page(pfn_to_page(entries[i].shadow_pfn));
 
@@ -532,7 +452,7 @@ void my_exit_mmap_dispatcher(struct mm_struct *mm)
 }
 
 /* -----------------------------------------------------------------------
- * exit_mmap trampoline（FIX-G）
+ * exit_mmap trampoline
  * ----------------------------------------------------------------------- */
 __attribute__((naked)) void my_exit_mmap_trampoline(void)
 {
@@ -576,7 +496,7 @@ __attribute__((naked)) void my_exit_mmap_trampoline(void)
 }
 
 /* -----------------------------------------------------------------------
- * ARM64 指令重定位引擎（FIX-B/I/J/Q）
+ * ARM64 指令重定位引擎
  * ----------------------------------------------------------------------- */
 static int arm64_relocate_insns(uint32_t *dst, unsigned long dst_pc,
                                 const uint32_t *src, unsigned long src_pc,
@@ -685,7 +605,8 @@ static int arm64_relocate_insns(uint32_t *dst, unsigned long dst_pc,
         if ((insn & 0x9F000000) == 0x90000000) {
             uint32_t Rd = insn & 0x1F;
             int64_t immhi=(int32_t)((insn>>5)<<14)>>14, immlo=(insn>>29)&3;
-            unsigned long target=(cur_src_pc&~0xFFFUL)+(unsigned long)(((immhi<<2)|immlo)<<12);
+            unsigned long target=(cur_src_pc&~0xFFFUL)+
+                                 (unsigned long)(((immhi<<2)|immlo)<<12);
             dst[di++] = 0xD2800000|Rd|(((target>> 0)&0xFFFF)<<5);
             dst[di++] = 0xF2A00000|Rd|(((target>>16)&0xFFFF)<<5);
             dst[di++] = 0xF2C00000|Rd|(((target>>32)&0xFFFF)<<5);
@@ -702,7 +623,7 @@ static int arm64_relocate_insns(uint32_t *dst, unsigned long dst_pc,
             dst[di++] = 0xF2A00010|(((target>>16)&0xFFFF)<<5);
             dst[di++] = 0xF2C00010|(((target>>32)&0xFFFF)<<5);
             dst[di++] = 0xF2E00010|(((target>>48)&0xFFFF)<<5);
-            switch(opc){
+            switch(opc) {
             case 0: dst[di++]=0xB9400200|Rt; break;
             case 1: dst[di++]=0xF9400200|Rt; break;
             case 2: dst[di++]=0xB9800200|Rt; break;
@@ -717,7 +638,7 @@ static int arm64_relocate_insns(uint32_t *dst, unsigned long dst_pc,
 }
 
 /* -----------------------------------------------------------------------
- * 安全 Unhook（FIX-M）
+ * 安全 Unhook
  * ----------------------------------------------------------------------- */
 static void do_safe_unhook(struct hook_site *site)
 {
@@ -731,14 +652,11 @@ static void do_safe_unhook(struct hook_site *site)
 
 /* -----------------------------------------------------------------------
  * inject_and_setup_rx
- *
- * [FIX-T] 核心变更：注入完成后立刻 mmput，绝不长期持有 mm_users。
- * [FIX-V] 进程切换：取出旧 mm 后出锁，锁外单次调用 dispatcher 清理。
  * ----------------------------------------------------------------------- */
 static int inject_and_setup_rx(struct rx_patch_req *req)
 {
     struct task_struct *task;
-    struct mm_struct   *mm, *old_mm = NULL;
+    struct mm_struct   *mm;
     struct page        *orig_page, *shadow_page;
     void               *kaddr_orig, *kaddr_shadow;
     pte_t              *game_ptep;
@@ -750,10 +668,12 @@ static int inject_and_setup_rx(struct rx_patch_req *req)
     bool                need_write_pte   = false;
     u64                 pte_val_to_write = 0;
 
+    /* addr==0：手动触发清理 */
     if (req->addr == 0) {
+        struct mm_struct *old_mm = NULL;
         spin_lock_irqsave(&g_rx_lock, flags);
-        old_mm = g_game_mm;
-        g_game_mm = NULL; /* 先置空，防止 dispatcher 并发操作 */
+        old_mm    = g_game_mm;
+        g_game_mm = NULL;
         spin_unlock_irqrestore(&g_rx_lock, flags);
         if (old_mm)
             my_exit_mmap_dispatcher(old_mm);
@@ -771,36 +691,21 @@ static int inject_and_setup_rx(struct rx_patch_req *req)
     mm = get_task_mm(task);
     if (!mm) { put_task_struct(task); return -EINVAL; }
 
-    /*
-     * [FIX-V] 进程切换检测：
-     *   取出 old_mm 后立刻出锁，在锁外调用 dispatcher 清理旧实例。
-     *   不在持锁/出锁边界反复横跳，避免状态不一致和重入。
-     */
+    /* 进程切换检测：清理旧实例 */
     spin_lock_irqsave(&g_rx_lock, flags);
     if (g_game_mm && g_game_mm != mm) {
-        old_mm    = g_game_mm;
-        g_game_mm = NULL; /* 提前置空，防止并发 dispatcher 操作旧实例 */
-    }
-    spin_unlock_irqrestore(&g_rx_lock, flags);
-
-    /* 锁外清理旧实例（my_exit_mmap_dispatcher 内部会再次加锁，
-     * 但因为我们已经将 g_game_mm 置 NULL，它会发现 mm != g_game_mm
-     * 并立刻返回——这里直接手动调用清理逻辑更清晰） */
-    if (old_mm) {
-        /* 直接清理旧实例的 shadow pages，不依赖 dispatcher 的身份判断 */
-        unsigned long f2;
-        spin_lock_irqsave(&g_rx_lock, f2);
+        g_game_mm = NULL;
         for (i = 0; i < MAX_RX_PAGES; i++) {
             if (g_rx_pages[i].active) {
                 __free_page(pfn_to_page(g_rx_pages[i].shadow_pfn));
                 g_rx_pages[i].active = false;
             }
         }
-        spin_unlock_irqrestore(&g_rx_lock, f2);
         pr_info("[RX] Old instance cleaned on process switch.\n");
     }
+    spin_unlock_irqrestore(&g_rx_lock, flags);
 
-    /* 查找已有 shadow page（同进程重复注入） */
+    /* 查找已有 shadow page */
     spin_lock_irqsave(&g_rx_lock, flags);
     for (i = 0; i < MAX_RX_PAGES; i++) {
         if (g_rx_pages[i].active &&
@@ -809,10 +714,6 @@ static int inject_and_setup_rx(struct rx_patch_req *req)
         }
     }
     if (p) {
-        /*
-         * [FIX-T] 更新已有 shadow page 内容。
-         * g_game_mm 记录弱引用（不增加 mm_users）。
-         */
         g_game_mm = mm;
         spin_unlock_irqrestore(&g_rx_lock, flags);
 
@@ -823,7 +724,6 @@ static int inject_and_setup_rx(struct rx_patch_req *req)
         asm volatile("ic ialluis\n dsb ish\n isb\n" ::: "memory");
         kpm_tlbi_page(p->vaddr);
 
-        /* [FIX-T] 立刻归还，不泄漏 mm_users */
         mmput(mm);
         put_task_struct(task);
         return 0;
@@ -853,7 +753,7 @@ static int inject_and_setup_rx(struct rx_patch_req *req)
 
     spin_unlock_irqrestore(&g_rx_lock, flags);
 
-    /* Shadow page 分配与初始化（可睡眠，在锁外） */
+    /* Shadow page 分配与初始化 */
     shadow_page = alloc_page(GFP_KERNEL | __GFP_ZERO);
     if (!shadow_page) {
         mmput(mm); put_task_struct(task);
@@ -870,27 +770,18 @@ static int inject_and_setup_rx(struct rx_patch_req *req)
     kunmap(orig_page);
     asm volatile("ic ialluis\n dsb ish\n isb\n" ::: "memory");
 
-    /* 提交：持锁写入全局状态 */
+    /* 提交全局状态 */
     spin_lock_irqsave(&g_rx_lock, flags);
 
     if (g_game_mm != NULL && g_game_mm != mm) {
-        /* 窗口期内又切换了进程，放弃本次注入 */
         spin_unlock_irqrestore(&g_rx_lock, flags);
         __free_page(shadow_page);
         mmput(mm); put_task_struct(task);
         return -EAGAIN;
     }
 
-    /*
-     * [FIX-T] 记录弱引用：
-     *   此处 mm_users >= 1（我们还持有 get_task_mm 的引用），
-     *   记录指针是安全的。函数末尾 mmput 后指针仍指向有效结构
-     *   （因为进程本身还持有 mm_users），直到 exit_mmap 触发时
-     *   我们的 hook 会清空 g_game_mm。
-     */
-    g_game_mm  = mm;
-    p->active  = true;
-
+    g_game_mm        = mm;
+    p->active        = true;
     need_write_pte   = true;
     pte_val_to_write = build_orig_pte(p);
 
@@ -920,7 +811,8 @@ static int inject_and_setup_rx(struct rx_patch_req *req)
                 safe_vmap_patch((unsigned long)my_escape_pod,
                                 reloc_buf, 1+reloc_cnt+4);
             }
-            hook_insns[0]=0x58000050; hook_insns[1]=0xD61F0200;
+            hook_insns[0] = 0x58000050;
+            hook_insns[1] = 0xD61F0200;
             *((uint64_t*)&hook_insns[2]) = (uint64_t)my_fault_trampoline;
             safe_vmap_patch(k_do_fault+4, hook_insns, HOOK_PROLOGUE_INSNS);
             g_hook_fault.installed = true;
@@ -944,7 +836,8 @@ static int inject_and_setup_rx(struct rx_patch_req *req)
                     safe_vmap_patch((unsigned long)my_exit_mmap_escape_pod,
                                     reloc_buf, 1+reloc_cnt+4);
                 }
-                hook_insns[0]=0x58000050; hook_insns[1]=0xD61F0200;
+                hook_insns[0] = 0x58000050;
+                hook_insns[1] = 0xD61F0200;
                 *((uint64_t*)&hook_insns[2]) = (uint64_t)my_exit_mmap_trampoline;
                 safe_vmap_patch(k_exit_mmap+4, hook_insns, HOOK_PROLOGUE_INSNS);
                 g_hook_exit_mmap.installed = true;
@@ -958,18 +851,10 @@ static int inject_and_setup_rx(struct rx_patch_req *req)
 
     spin_unlock_irqrestore(&g_rx_lock, flags);
 
-    /* [FIX-O] 出锁后写 PTE */
     if (need_write_pte)
         pte_write_locked(mm, p->vaddr, game_pmd, game_ptep, pte_val_to_write);
 
-    /*
-     * [FIX-T] 任务完成，归还 get_task_mm 持有的引用。
-     *
-     * 此后 g_game_mm 是真正的弱引用：
-     *   - 进程正常运行：mm_users >= 1（进程自身持有），指针有效。
-     *   - 进程退出：exit_mmap hook 触发，g_game_mm 被置 NULL。
-     *   - 任何读取路径：必须通过 mmget_not_zero() 升级后才能解引用。
-     */
+    /* 归还引用，g_game_mm 保持弱引用语义 */
     mmput(mm);
     put_task_struct(task);
     return 0;
@@ -987,7 +872,7 @@ static void rx_inject_work_fn(struct work_struct *work)
 }
 
 /* -----------------------------------------------------------------------
- * Netlink 接收回调（FIX-L）
+ * Netlink 接收回调
  * ----------------------------------------------------------------------- */
 static void nl_recv_msg(struct sk_buff *skb)
 {
@@ -1023,23 +908,22 @@ static int __init rx_shadow_init(void)
 
 static void __exit rx_shadow_exit(void)
 {
+    int i;
+    unsigned long flags;
+
     if (nl_sk)   netlink_kernel_release(nl_sk);
     if (g_rx_wq) { flush_workqueue(g_rx_wq); destroy_workqueue(g_rx_wq); }
 
-    /* 模块卸载时手动清理（游戏仍在运行的情况） */
-    {
-        unsigned long flags;
-        int i;
-        spin_lock_irqsave(&g_rx_lock, flags);
-        g_game_mm = NULL;
-        for (i = 0; i < MAX_RX_PAGES; i++) {
-            if (g_rx_pages[i].active) {
-                __free_page(pfn_to_page(g_rx_pages[i].shadow_pfn));
-                g_rx_pages[i].active = false;
-            }
+    /* 游戏仍在运行时的兜底清理 */
+    spin_lock_irqsave(&g_rx_lock, flags);
+    g_game_mm = NULL;
+    for (i = 0; i < MAX_RX_PAGES; i++) {
+        if (g_rx_pages[i].active) {
+            __free_page(pfn_to_page(g_rx_pages[i].shadow_pfn));
+            g_rx_pages[i].active = false;
         }
-        spin_unlock_irqrestore(&g_rx_lock, flags);
     }
+    spin_unlock_irqrestore(&g_rx_lock, flags);
 
     do_safe_unhook(&g_hook_fault);
     do_safe_unhook(&g_hook_exit_mmap);
